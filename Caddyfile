@@ -5,5 +5,9 @@
 		# SSE: sin buffering ni timeouts cortos en el proxy
 		flush_interval -1
 	}
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		-Server
+	}
 	encode gzip
 }

@@ -5,7 +5,9 @@ import {
   AlertTriangle,
   Check,
   CheckCheck,
+  ChevronUp,
   Clock3,
+  Loader2,
   Paperclip,
   Sparkles,
 } from "lucide-react";
@@ -41,19 +43,48 @@ function bubbleTime(iso: string): string {
   });
 }
 
-export function MessageThread({ messages }: { messages: MessageDto[] }) {
+export function MessageThread({
+  messages,
+  hasOlder,
+  loadingOlder,
+  onLoadOlder,
+}: {
+  messages: MessageDto[];
+  hasOlder: boolean;
+  loadingOlder: boolean;
+  onLoadOlder: () => void;
+}) {
   const scrollRef = useRef<HTMLDivElement>(null);
+  const lastMessageId = messages[messages.length - 1]?.id;
 
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [messages.length]);
+  }, [lastMessageId]);
 
   return (
     <div
       ref={scrollRef}
       className="flex flex-1 flex-col gap-[3px] overflow-y-auto bg-chat px-[6%] py-5"
+      aria-busy={loadingOlder}
     >
+      {hasOlder && (
+        <div className="mb-2 flex justify-center">
+          <button
+            type="button"
+            disabled={loadingOlder}
+            onClick={onLoadOlder}
+            className="inline-flex items-center gap-1.5 rounded-full border bg-background px-3 py-1.5 text-xs font-medium text-text-2 shadow-sm hover:bg-accent disabled:opacity-60"
+          >
+            {loadingOlder ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+            ) : (
+              <ChevronUp className="h-3.5 w-3.5" aria-hidden="true" />
+            )}
+            {loadingOlder ? "Cargando?" : "Ver mensajes anteriores"}
+          </button>
+        </div>
+      )}
       {messages.map((m, i) => {
         const prev = messages[i - 1];
         const newDay =

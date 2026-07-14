@@ -1,5 +1,4 @@
 import type { Config } from "tailwindcss";
-import animate from "tailwindcss-animate";
 
 /**
  * Los nombres semánticos existentes (background, primary, muted…) se remapean
@@ -77,7 +76,7 @@ const config: Config = {
       },
     },
   },
-  plugins: [animate],
+  plugins: [],
 };
 
 export default config;

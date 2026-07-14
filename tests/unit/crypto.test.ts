@@ -5,7 +5,6 @@ beforeAll(() => {
   process.env.DATABASE_URL = "postgresql://test:test@localhost:5432/test";
   process.env.BETTER_AUTH_SECRET = "secret-de-test-suficiente";
   process.env.ENCRYPTION_KEY = Buffer.alloc(32, 7).toString("base64");
-  process.env.META_WEBHOOK_VERIFY_TOKEN = "verify-token-test";
 });
 
 describe("crypto AES-256-GCM", () => {

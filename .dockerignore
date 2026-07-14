@@ -2,8 +2,10 @@ node_modules
 .next
 .git
 .env*
-!.env.example
 *.log
+*.dump
+backups
+.tmp-*
 coverage
 .playwright-mcp
 docs

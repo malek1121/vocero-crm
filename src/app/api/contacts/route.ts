@@ -1,4 +1,4 @@
-import { desc, ilike, or } from "drizzle-orm";
+import { desc, ilike, isNull, or } from "drizzle-orm";
 import { z } from "zod";
 import { apiError, parseBody, withAuth } from "@/lib/api";
 import { getDb, schema } from "@/lib/db";
@@ -26,16 +26,14 @@ export const GET = withAuth(async (session, req: Request) => {
               ilike(schema.contact.name, `%${q}%`),
               ilike(schema.contact.phone, `%${q}%`)
             )
-          : undefined
+          : undefined,
+        includeArchived ? undefined : isNull(schema.contact.archivedAt)
       )
     )
     .orderBy(desc(schema.contact.updatedAt))
     .limit(200);
 
-  const contacts = rows
-    .filter((c) => includeArchived || !c.archivedAt)
-    .map(serializeContact);
-  return Response.json({ contacts });
+  return Response.json({ contacts: rows.map(serializeContact) });
 });
 
 const createSchema = z.object({

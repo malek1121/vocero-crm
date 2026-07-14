@@ -5,6 +5,7 @@ import Link from "next/link";
 import {
   DndContext,
   DragOverlay,
+  KeyboardSensor,
   PointerSensor,
   useDraggable,
   useDroppable,
@@ -16,6 +17,7 @@ import {
 import { MessageSquareText, Settings2, Trophy, XCircle } from "lucide-react";
 import type { StageDto } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { apiRequest } from "@/lib/client-api";
 import { ContactAvatar } from "@/components/avatar";
 import { Button } from "@/components/ui/button";
 import { formatTime } from "@/components/inbox/helpers";
@@ -35,17 +37,28 @@ export function PipelineClient() {
   const [leads, setLeads] = useState<BoardLead[]>([]);
   const [activeLead, setActiveLead] = useState<BoardLead | null>(null);
   const [managing, setManaging] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [truncated, setTruncated] = useState(false);
 
   const sensors = useSensors(
-    useSensor(PointerSensor, { activationConstraint: { distance: 6 } })
+    useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
+    useSensor(KeyboardSensor)
   );
 
   const refetch = useCallback(async () => {
-    const res = await fetch("/api/pipeline/board").catch(() => null);
-    if (!res?.ok) return;
-    const data = (await res.json()) as { stages: StageDto[]; leads: BoardLead[] };
-    setStages(data.stages);
-    setLeads(data.leads);
+    try {
+      const data = await apiRequest<{
+        stages: StageDto[];
+        leads: BoardLead[];
+        truncated?: boolean;
+      }>("/api/pipeline/board", undefined, "No se pudo cargar el pipeline");
+      setStages(data.stages);
+      setLeads(data.leads);
+      setTruncated(Boolean(data.truncated));
+      setError(null);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "No se pudo cargar el pipeline");
+    }
   }, []);
 
   useEffect(() => {
@@ -62,20 +75,32 @@ export function PipelineClient() {
     const leadId = String(event.active.id);
     const overStage = event.over ? String(event.over.id) : null;
     if (!overStage) return;
-    const lead = leads.find((l) => l.id === leadId);
+    const lead = leads.find((item) => item.id === leadId);
     if (!lead || lead.stageId === overStage) return;
 
-    const position = leads.filter((l) => l.stageId === overStage).length;
-    // Optimista + persistencia
-    setLeads((prev) =>
-      prev.map((l) => (l.id === leadId ? { ...l, stageId: overStage, position } : l))
+    const position = leads.filter((item) => item.stageId === overStage).length;
+    const previous = leads;
+    setLeads((current) =>
+      current.map((item) =>
+        item.id === leadId ? { ...item, stageId: overStage, position } : item
+      )
     );
-    await fetch(`/api/pipeline/leads/${leadId}`, {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ stageId: overStage, position }),
-    }).catch(() => null);
-    void refetch();
+    setError(null);
+    try {
+      await apiRequest(
+        `/api/pipeline/leads/${leadId}`,
+        {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ stageId: overStage, position }),
+        },
+        "No se pudo mover la tarjeta"
+      );
+      await refetch();
+    } catch (requestError) {
+      setLeads(previous);
+      setError(requestError instanceof Error ? requestError.message : "No se pudo mover la tarjeta");
+    }
   }
 
   return (
@@ -86,6 +111,12 @@ export function PipelineClient() {
           <Settings2 className="h-4 w-4" /> Gestionar etapas
         </Button>
       </header>
+
+      {(error || truncated) && (
+        <p className="border-b px-6 py-2 text-sm text-destructive" role="alert">
+          {error ?? "El tablero es muy grande: se muestran las primeras 1.000 tarjetas."}
+        </p>
+      )}
 
       <div className="flex-1 overflow-x-auto p-4">
         <DndContext

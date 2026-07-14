@@ -5,15 +5,16 @@ const nano = customAlphabet(alphabet, 20);
 
 const prefixes = {
   organization: "org",
+  member: "mem",
   contact: "ct",
   conversation: "cv",
   message: "msg",
+  agentDispatch: "dispatch",
   lead: "ld",
   stage: "stg",
-  credentials: "cred",
+  baileysAuth: "ba",
   agentProfile: "agp",
   kbEntry: "kb",
-  template: "tpl",
   testRun: "run",
   testCase: "case",
 } as const;

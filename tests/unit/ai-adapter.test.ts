@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
-import { chatJson, extractJson } from "@/lib/ai";
+import { AiAbortError, chatJson, extractJson } from "@/lib/ai";
 
 describe("extractJson (extracción robusta)", () => {
   it("JSON limpio", () => {
@@ -30,9 +30,8 @@ describe("chatJson (reintentos y errores tipados)", () => {
     vi.stubEnv("DATABASE_URL", "postgresql://t:t@localhost:5432/t");
     vi.stubEnv("BETTER_AUTH_SECRET", "secret-de-test-suficiente");
     vi.stubEnv("ENCRYPTION_KEY", Buffer.alloc(32, 3).toString("base64"));
-    vi.stubEnv("META_WEBHOOK_VERIFY_TOKEN", "verify-test");
-    vi.stubEnv("OPENROUTER_API_TOKEN", "token-test");
-    vi.stubEnv("OPENROUTER_MODEL", "modelo-test");
+    vi.stubEnv("AI_API_TOKEN", "token-test");
+    vi.stubEnv("AI_MODEL", "modelo-test");
   });
 
   afterEach(() => {
@@ -90,8 +89,40 @@ describe("chatJson (reintentos y errores tipados)", () => {
     if (!result.ok) expect(result.error).toBe("invalid_output");
   });
 
+  it("never returns provider bodies or model output in failure detail", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response("customer-secret provider body", { status: 500 })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await chatJson(
+      schema,
+      [{ role: "user", content: "customer-secret prompt" }],
+      { timeoutMs: 10 }
+    );
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.detail).toBe("provider_http_500");
+      expect(result.detail).not.toContain("customer-secret");
+    }
+  });
+
+  it("propagates cancellation before touching the provider", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      chatJson(schema, [{ role: "user", content: "secret" }], {
+        signal: controller.signal,
+      })
+    ).rejects.toBeInstanceOf(AiAbortError);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
   it("sin token → not_configured sin tocar la red", async () => {
-    vi.stubEnv("OPENROUTER_API_TOKEN", "");
+    vi.stubEnv("AI_API_TOKEN", "");
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
 

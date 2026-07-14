@@ -1,12 +1,7 @@
 import type { z } from "zod";
 import { getEnv, isAiConfigured } from "@/lib/env";
 
-/**
- * Adaptador LLM OpenRouter-compatible — ÚNICA frontera con el proveedor de IA
- * (Constitución II). Regla operativa: la salida del modelo es impredecible;
- * todo consumo pasa por extracción robusta + Zod + reintentos, y un hipo del
- * proveedor jamás propaga excepción (resultado `error` tipado).
- */
+/** OpenAI-compatible boundary. Prompts and provider bodies never enter errors. */
 
 export type ChatMessage = {
   role: "system" | "user" | "assistant";
@@ -14,8 +9,40 @@ export type ChatMessage = {
 };
 
 export type ChatJsonResult<T> =
-  | { ok: true; data: T; raw: string }
-  | { ok: false; error: "not_configured" | "provider_error" | "invalid_output"; detail: string };
+  | { ok: true; data: T }
+  | {
+      ok: false;
+      error: "not_configured" | "provider_error" | "invalid_output";
+      detail: string;
+      attempts: number;
+      providerStatus?: number;
+    };
+
+export type ChatJsonOptions = {
+  model?: string;
+  judge?: boolean;
+  timeoutMs?: number;
+  signal?: AbortSignal;
+};
+
+export class AiAbortError extends Error {
+  constructor() {
+    super("AI operation aborted");
+    this.name = "AiAbortError";
+  }
+}
+
+class ProviderCallError extends Error {
+  readonly detail: string;
+  readonly status: number | undefined;
+
+  constructor(detail: string, status?: number) {
+    super(detail);
+    this.name = "ProviderCallError";
+    this.detail = detail;
+    this.status = status;
+  }
+}
 
 const MAX_ATTEMPTS = 3;
 const RETRY_DELAY_MS = 500;
@@ -23,31 +50,35 @@ const RETRY_DELAY_MS = 500;
 export async function chatJson<T>(
   schema: z.ZodType<T>,
   messages: ChatMessage[],
-  opts?: { model?: string; judge?: boolean; timeoutMs?: number }
+  opts: ChatJsonOptions = {}
 ): Promise<ChatJsonResult<T>> {
+  throwIfAborted(opts.signal);
   if (!isAiConfigured()) {
     return {
       ok: false,
       error: "not_configured",
-      detail: "Sin OPENROUTER_API_TOKEN configurado",
+      detail: "ai_token_missing",
+      attempts: 0,
     };
   }
+
   const env = getEnv();
   const model =
-    opts?.model ??
-    (opts?.judge
-      ? (env.OPENROUTER_JUDGE_MODEL ?? env.OPENROUTER_MODEL)
-      : env.OPENROUTER_MODEL);
+    opts.model ??
+    (opts.judge ? (env.AI_JUDGE_MODEL ?? env.AI_MODEL) : env.AI_MODEL);
   if (!model?.trim()) {
     return {
       ok: false,
       error: "not_configured",
-      detail: "Sin OPENROUTER_MODEL configurado",
+      detail: "ai_model_missing",
+      attempts: 0,
     };
   }
 
-  let lastDetail = "";
+  let lastDetail = "provider_request_failed";
+  let providerStatus: number | undefined;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    throwIfAborted(opts.signal);
     const attemptMessages: ChatMessage[] =
       attempt === 1
         ? messages
@@ -56,82 +87,115 @@ export async function chatJson<T>(
             {
               role: "system",
               content:
-                "STRICT: tu respuesta anterior no fue JSON válido según el esquema. Responde ÚNICAMENTE el objeto JSON, sin explicaciones ni markdown.",
+                "STRICT: la respuesta anterior no fue JSON válido según el esquema. Responde ÚNICAMENTE el objeto JSON, sin explicaciones ni markdown.",
             },
           ];
+
     try {
-      const raw = await callProvider(model, attemptMessages, opts?.timeoutMs);
+      const raw = await callProvider(
+        model,
+        attemptMessages,
+        opts.timeoutMs,
+        opts.signal
+      );
       const extracted = extractJson(raw);
       if (extracted === null) {
-        lastDetail = `sin JSON extraíble (raw=${truncate(raw)})`;
+        lastDetail = "invalid_json";
         continue;
       }
       const parsed = schema.safeParse(extracted);
       if (!parsed.success) {
-        lastDetail = `no cumple el esquema: ${parsed.error.issues
-          .map((i) => i.path.join(".") + " " + i.message)
-          .join("; ")} (raw=${truncate(raw)})`;
+        lastDetail = "schema_validation_failed";
         continue;
       }
-      return { ok: true, data: parsed.data, raw };
-    } catch (err) {
-      lastDetail = err instanceof Error ? err.message : String(err);
+      return { ok: true, data: parsed.data };
+    } catch (error) {
+      if (error instanceof AiAbortError) throw error;
+      if (error instanceof ProviderCallError) {
+        lastDetail = error.detail;
+        providerStatus = error.status;
+      } else {
+        lastDetail = "provider_request_failed";
+      }
       if (attempt < MAX_ATTEMPTS) {
-        await sleep(RETRY_DELAY_MS * attempt);
+        await sleep(RETRY_DELAY_MS * attempt, opts.signal);
       }
     }
   }
 
+  const invalidOutput =
+    lastDetail === "invalid_json" ||
+    lastDetail === "schema_validation_failed";
   return {
     ok: false,
-    error: lastDetail.includes("esquema") || lastDetail.includes("JSON")
-      ? "invalid_output"
-      : "provider_error",
+    error: invalidOutput ? "invalid_output" : "provider_error",
     detail: lastDetail,
+    attempts: MAX_ATTEMPTS,
+    ...(providerStatus === undefined ? {} : { providerStatus }),
   };
 }
 
 async function callProvider(
   model: string,
   messages: ChatMessage[],
-  timeoutMs = 60_000
+  timeoutMs = 60_000,
+  signal?: AbortSignal
 ): Promise<string> {
+  throwIfAborted(signal);
   const env = getEnv();
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let timedOut = false;
+  const onAbort = () => controller.abort();
+  signal?.addEventListener("abort", onAbort, { once: true });
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, Math.max(1, timeoutMs));
+
   try {
-    const res = await fetch(`${env.OPENROUTER_BASE_URL}/v1/chat/completions`, {
-      method: "POST",
-      headers: {
-        // El token jamás se loguea; solo viaja en este header.
-        Authorization: `Bearer ${env.OPENROUTER_API_TOKEN}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ model, messages }),
-      signal: controller.signal,
-    });
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      throw new Error(`proveedor respondió ${res.status}: ${truncate(text)}`);
+    let response: Response;
+    try {
+      response = await fetch(`${env.AI_BASE_URL}/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${env.AI_API_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ model, messages }),
+        signal: controller.signal,
+      });
+    } catch {
+      if (signal?.aborted) throw new AiAbortError();
+      throw new ProviderCallError(
+        timedOut ? "provider_timeout" : "provider_network_error"
+      );
     }
-    const json = (await res.json()) as {
-      choices?: { message?: { content?: string } }[];
-    };
-    const content = json.choices?.[0]?.message?.content;
-    if (typeof content !== "string" || content.length === 0) {
-      throw new Error("respuesta del proveedor sin contenido");
+
+    if (!response.ok) {
+      throw new ProviderCallError(
+        `provider_http_${response.status}`,
+        response.status
+      );
     }
-    return content;
+
+    let json: { choices?: { message?: { content?: string } }[] };
+    try {
+      json = (await response.json()) as typeof json;
+    } catch {
+      throw new ProviderCallError("provider_invalid_response");
+    }
+    const modelOutput = json.choices?.[0]?.message?.content;
+    if (typeof modelOutput !== "string" || modelOutput.length === 0) {
+      throw new ProviderCallError("provider_empty_response");
+    }
+    return modelOutput;
   } finally {
     clearTimeout(timer);
+    signal?.removeEventListener("abort", onAbort);
   }
 }
 
-/**
- * Extracción robusta de JSON de una respuesta de modelo:
- * 1) bloque ```json ... ``` (o ``` ... ```), 2) el texto completo,
- * 3) del primer `{` al último `}`.
- */
+/** Extracts JSON from a fenced block, full text, or first-to-last braces. */
 export function extractJson(raw: string): unknown | null {
   const candidates: string[] = [];
   const fence = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
@@ -142,20 +206,31 @@ export function extractJson(raw: string): unknown | null {
   if (first !== -1 && last > first) {
     candidates.push(raw.slice(first, last + 1));
   }
-  for (const c of candidates) {
+  for (const candidate of candidates) {
     try {
-      return JSON.parse(c);
+      return JSON.parse(candidate);
     } catch {
-      // siguiente candidato
+      // Try the next extraction strategy.
     }
   }
   return null;
 }
 
-function truncate(s: string, n = 300): string {
-  return s.length > n ? `${s.slice(0, n)}…` : s;
+export function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new AiAbortError();
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  throwIfAborted(signal);
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new AiAbortError());
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }

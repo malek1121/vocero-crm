@@ -1,60 +1,51 @@
 import { and, asc, eq } from "drizzle-orm";
 import { getDb, schema } from "@/lib/db";
 import { newId } from "@/lib/db/ids";
+import { throwIfAborted } from "@/lib/ai";
 import { publish } from "@/server/events/bus";
 import { runAgentTurn } from "@/server/ai/pipeline";
 import { renderKb } from "@/server/ai/prompts";
-import { computeScore, judgeCase } from "@/server/lab/judge";
+import { judgeCase } from "@/server/lab/judge";
 import { PERSONAS, type Persona } from "@/server/lab/personas";
-
-/**
- * Runner del Laboratorio (FR-030/FR-034): corrida en segundo plano DENTRO del
- * proceso (sin cola externa), turnos secuenciales con debounce 0, timeout
- * global de 10 minutos, y lock de concurrencia por índice parcial UNIQUE en
- * BD (máx. 1 corrida `running` por organización).
- *
- * Sandbox (FR-031): las conversaciones se crean con is_test=true; el pipeline
- * del agente persiste las respuestas sin tocar la API, y el sender real lanza
- * si algo intenta enviarlas.
- */
+import { createRunDeadline } from "@/server/lab/run-control";
+import { computeScore } from "@/server/lab/score";
 
 const RUN_TIMEOUT_MS = 10 * 60 * 1000;
+
+type RunFailureCode = "run_timeout" | "run_failed" | "process_restarted";
 
 export class RunConflictError extends Error {}
 
 export async function startRun(organizationId: string): Promise<string> {
   const db = getDb();
-  let runId: string;
+  const runId = newId("testRun");
   try {
-    const inserted = await db
-      .insert(schema.agentTestRun)
-      .values({ id: newId("testRun"), organizationId, status: "running" })
-      .returning();
-    runId = inserted[0]!.id;
-  } catch (err) {
-    // Violación del índice parcial UNIQUE → ya hay una corrida activa.
-    if (isUniqueViolation(err)) {
+    await db.transaction(async (tx) => {
+      await tx.insert(schema.agentTestRun).values({
+        id: runId,
+        organizationId,
+        status: "running",
+      });
+      await tx.insert(schema.agentTestCase).values(
+        PERSONAS.map((persona) => ({
+          id: newId("testCase"),
+          organizationId,
+          runId,
+          persona: persona.key,
+          status: "pending" as const,
+        }))
+      );
+    });
+  } catch (error) {
+    if (isUniqueViolation(error)) {
       throw new RunConflictError("Ya hay una corrida en curso");
     }
-    throw err;
+    throw error;
   }
 
-  await db.insert(schema.agentTestCase).values(
-    PERSONAS.map((p) => ({
-      id: newId("testCase"),
-      organizationId,
-      runId,
-      persona: p.key,
-      status: "pending" as const,
-    }))
+  void executeRun(runId, organizationId).catch(() =>
+    console.error("[lab] run_executor_failed")
   );
-
-  // Fire-and-forget in-process: el POST regresa ya; el progreso va por SSE.
-  void executeRun(runId, organizationId).catch(async (err) => {
-    console.error("[lab] corrida falló:", err);
-    await failRun(runId, organizationId, String(err));
-  });
-
   return runId;
 }
 
@@ -62,28 +53,37 @@ async function executeRun(
   runId: string,
   organizationId: string
 ): Promise<void> {
-  const timeout = new Promise<never>((_, reject) =>
-    setTimeout(
-      () => reject(new Error("timeout de 10 minutos superado")),
-      RUN_TIMEOUT_MS
-    )
-  );
+  const deadline = createRunDeadline(RUN_TIMEOUT_MS);
   try {
-    await Promise.race([runAllCases(runId, organizationId), timeout]);
-  } catch (err) {
-    await failRun(runId, organizationId, String(err));
+    await runAllCases(runId, organizationId, deadline.signal);
+    throwIfAborted(deadline.signal);
+  } catch {
+    await failRun(
+      runId,
+      organizationId,
+      deadline.timedOut() ? "run_timeout" : "run_failed"
+    );
+  } finally {
+    deadline.clear();
   }
 }
 
 async function runAllCases(
   runId: string,
-  organizationId: string
+  organizationId: string,
+  signal: AbortSignal
 ): Promise<void> {
+  throwIfAborted(signal);
   const db = getDb();
   const cases = await db
     .select()
     .from(schema.agentTestCase)
-    .where(eq(schema.agentTestCase.runId, runId))
+    .where(
+      and(
+        eq(schema.agentTestCase.runId, runId),
+        eq(schema.agentTestCase.organizationId, organizationId)
+      )
+    )
     .orderBy(asc(schema.agentTestCase.createdAt));
 
   const kbEntries = await db
@@ -114,25 +114,38 @@ async function runAllCases(
   publishProgress(organizationId, runId, "running", done, total);
 
   for (const testCase of cases) {
-    const persona = PERSONAS.find((p) => p.key === testCase.persona);
-    if (!persona) continue;
+    throwIfAborted(signal);
+    const persona = PERSONAS.find((candidate) => candidate.key === testCase.persona);
+    if (!persona) throw new Error("lab_persona_missing");
 
     await db
       .update(schema.agentTestCase)
       .set({ status: "running" })
-      .where(eq(schema.agentTestCase.id, testCase.id));
+      .where(
+        and(
+          eq(schema.agentTestCase.id, testCase.id),
+          eq(schema.agentTestCase.organizationId, organizationId),
+          eq(schema.agentTestCase.runId, runId)
+        )
+      );
 
     const { transcript, conversationId } = await runConversation(
       organizationId,
-      persona
+      persona,
+      signal
     );
+    throwIfAborted(signal);
 
-    const outcome = await judgeCase({
-      personaKey: persona.key,
-      transcript,
-      kbText,
-      behaviorText,
-    });
+    const outcome = await judgeCase(
+      {
+        personaKey: persona.key,
+        transcript,
+        kbText,
+        behaviorText,
+      },
+      signal
+    );
+    throwIfAborted(signal);
 
     await db
       .update(schema.agentTestCase)
@@ -143,44 +156,62 @@ async function runAllCases(
         veredicto: outcome.status === "done" ? outcome.verdict.veredicto : null,
         hallazgos: outcome.status === "done" ? outcome.verdict.hallazgos : null,
       })
-      .where(eq(schema.agentTestCase.id, testCase.id));
+      .where(
+        and(
+          eq(schema.agentTestCase.id, testCase.id),
+          eq(schema.agentTestCase.organizationId, organizationId),
+          eq(schema.agentTestCase.runId, runId)
+        )
+      );
 
     done += 1;
     publishProgress(organizationId, runId, "running", done, total);
   }
 
+  throwIfAborted(signal);
   const finalCases = await db
     .select({
       status: schema.agentTestCase.status,
       veredicto: schema.agentTestCase.veredicto,
     })
     .from(schema.agentTestCase)
-    .where(eq(schema.agentTestCase.runId, runId));
+    .where(
+      and(
+        eq(schema.agentTestCase.runId, runId),
+        eq(schema.agentTestCase.organizationId, organizationId)
+      )
+    );
   const score = computeScore(finalCases);
 
-  await getDb()
+  const completed = await db
     .update(schema.agentTestRun)
-    .set({ status: "done", score, finishedAt: new Date() })
-    .where(eq(schema.agentTestRun.id, runId));
+    .set({ status: "done", score, error: null, finishedAt: new Date() })
+    .where(
+      and(
+        eq(schema.agentTestRun.id, runId),
+        eq(schema.agentTestRun.organizationId, organizationId),
+        eq(schema.agentTestRun.status, "running")
+      )
+    )
+    .returning({ id: schema.agentTestRun.id });
+  if (!completed[0]) return;
   publishProgress(organizationId, runId, "done", done, total, score);
 }
 
-/** Conversa el guion completo contra el agente real; corta al primer handoff. */
 async function runConversation(
   organizationId: string,
-  persona: Persona
+  persona: Persona,
+  signal: AbortSignal
 ): Promise<{
   transcript: { role: "cliente" | "agente"; text: string }[];
   conversationId: string;
 }> {
+  throwIfAborted(signal);
   const db = getDb();
-
-  // Contacto sintético ARCHIVADO (no aparece en la lista ni genera leads).
   const contactId = await upsertTestContact(organizationId, persona);
-
-  const convId = newId("conversation");
+  const conversationId = newId("conversation");
   await db.insert(schema.conversation).values({
-    id: convId,
+    id: conversationId,
     organizationId,
     contactId,
     isTest: true,
@@ -188,11 +219,12 @@ async function runConversation(
   });
 
   for (const line of persona.script) {
+    throwIfAborted(signal);
     const now = new Date();
     await db.insert(schema.message).values({
       id: newId("message"),
       organizationId,
-      conversationId: convId,
+      conversationId,
       direction: "in",
       type: "text",
       text: line,
@@ -202,32 +234,48 @@ async function runConversation(
     await db
       .update(schema.conversation)
       .set({ lastInboundAt: now, lastMessageAt: now, updatedAt: now })
-      .where(eq(schema.conversation.id, convId));
+      .where(
+        and(
+          eq(schema.conversation.id, conversationId),
+          eq(schema.conversation.organizationId, organizationId)
+        )
+      );
 
-    // Turno REAL del agente, secuencial y sin debounce (FR-030).
-    await runAgentTurn(convId);
+    await runAgentTurn(conversationId, { signal });
+    throwIfAborted(signal);
 
-    const convRows = await db
+    const conversationRows = await db
       .select({ handoffAt: schema.conversation.handoffAt })
       .from(schema.conversation)
-      .where(eq(schema.conversation.id, convId))
+      .where(
+        and(
+          eq(schema.conversation.id, conversationId),
+          eq(schema.conversation.organizationId, organizationId)
+        )
+      )
       .limit(1);
-    if (convRows[0]?.handoffAt) break; // primer handoff → fin del guion
+    if (conversationRows[0]?.handoffAt) break;
   }
 
+  throwIfAborted(signal);
   const messages = await db
     .select()
     .from(schema.message)
-    .where(eq(schema.message.conversationId, convId))
+    .where(
+      and(
+        eq(schema.message.conversationId, conversationId),
+        eq(schema.message.organizationId, organizationId)
+      )
+    )
     .orderBy(asc(schema.message.createdAt));
 
   return {
-    conversationId: convId,
+    conversationId,
     transcript: messages
-      .filter((m) => m.text)
-      .map((m) => ({
-        role: m.direction === "in" ? ("cliente" as const) : ("agente" as const),
-        text: m.text!,
+      .filter((message) => message.text)
+      .map((message) => ({
+        role: message.direction === "in" ? ("cliente" as const) : ("agente" as const),
+        text: message.text!,
       })),
   };
 }
@@ -246,11 +294,10 @@ async function upsertTestContact(
       name: persona.contactName,
       archivedAt: new Date(),
     })
-    .onConflictDoNothing({
-      target: [schema.contact.organizationId, schema.contact.phone],
-    })
+    .onConflictDoNothing()
     .returning();
   if (inserted[0]) return inserted[0].id;
+
   const rows = await db
     .select({ id: schema.contact.id })
     .from(schema.contact)
@@ -261,19 +308,29 @@ async function upsertTestContact(
       )
     )
     .limit(1);
-  return rows[0]!.id;
+  const contact = rows[0];
+  if (!contact) throw new Error("lab_contact_missing");
+  return contact.id;
 }
 
 async function failRun(
   runId: string,
   organizationId: string,
-  error: string
+  error: RunFailureCode
 ): Promise<void> {
   const db = getDb();
-  await db
+  const failed = await db
     .update(schema.agentTestRun)
-    .set({ status: "failed", error, finishedAt: new Date() })
-    .where(eq(schema.agentTestRun.id, runId));
+    .set({ status: "failed", score: null, error, finishedAt: new Date() })
+    .where(
+      and(
+        eq(schema.agentTestRun.id, runId),
+        eq(schema.agentTestRun.organizationId, organizationId),
+        eq(schema.agentTestRun.status, "running")
+      )
+    )
+    .returning({ id: schema.agentTestRun.id });
+  if (!failed[0]) return;
   publishProgress(organizationId, runId, "failed", 0, PERSONAS.length);
 }
 
@@ -285,14 +342,18 @@ function publishProgress(
   total: number,
   score?: number | null
 ): void {
-  publish(organizationId, {
-    type: "lab.run",
-    data: { runId, status, progress: { done, total }, score },
-  });
+  try {
+    publish(organizationId, {
+      type: "lab.run",
+      data: { runId, status, progress: { done, total }, score },
+    });
+  } catch {
+    console.error("[lab] progress_publish_failed");
+  }
 }
 
-function isUniqueViolation(err: unknown): boolean {
-  if (typeof err !== "object" || err === null) return false;
-  const e = err as { code?: string; cause?: { code?: string } };
-  return e.code === "23505" || e.cause?.code === "23505";
+function isUniqueViolation(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const candidate = error as { code?: string; cause?: { code?: string } };
+  return candidate.code === "23505" || candidate.cause?.code === "23505";
 }

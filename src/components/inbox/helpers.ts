@@ -14,14 +14,6 @@ export function formatTime(iso: string | null): string {
   return d.toLocaleDateString("es-MX", { day: "numeric", month: "short" });
 }
 
-export function formatRemaining(ms: number): string {
-  const totalMin = Math.floor(ms / 60000);
-  const h = Math.floor(totalMin / 60);
-  const m = totalMin % 60;
-  if (h > 0) return `${h}h ${m}m`;
-  return `${m}m`;
-}
-
 const MEDIA_LABELS: Record<string, string> = {
   image: "Imagen",
   audio: "Audio",

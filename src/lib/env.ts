@@ -18,17 +18,14 @@ const envSchema = z.object({
       message:
         "ENCRYPTION_KEY debe ser 32 bytes en base64 (genera con: openssl rand -base64 32)",
     }),
-  META_WEBHOOK_VERIFY_TOKEN: z.string().min(8),
-  META_APP_SECRET: z.string().optional(),
-  META_GRAPH_API_VERSION: z.string().default("v25.0"),
-  META_GRAPH_BASE_URL: z.string().url().default("https://graph.facebook.com"),
-  OPENROUTER_API_TOKEN: z.string().optional(),
-  OPENROUTER_BASE_URL: z.string().url().default("https://openrouter.ai/api"),
-  OPENROUTER_MODEL: z.string().optional(),
-  OPENROUTER_JUDGE_MODEL: z.string().optional(),
-  ALLOW_SIGNUP: z.string().optional(),
+  // Proveedor LLM OpenAI-compatible. Por defecto: Cloudflare Workers AI.
+  // AI_BASE_URL debe incluir el account id: .../accounts/<ACCOUNT_ID>/ai
+  AI_API_TOKEN: z.string().optional(),
+  AI_BASE_URL: z.string().url().default("https://api.cloudflare.com/client/v4"),
+  AI_MODEL: z.string().optional(),
+  AI_JUDGE_MODEL: z.string().optional(),
   AGENT_COALESCE_MS: z.coerce.number().int().min(0).default(6000),
-  WA_MOCK_ENABLED: z.string().optional(),
+  MOCK_ENABLED: z.string().optional(),
   NODE_ENV: z.string().default("development"),
 });
 
@@ -39,7 +36,6 @@ const BUILD_PLACEHOLDERS: Record<string, string> = {
   DATABASE_URL: "postgresql://build:build@localhost:5432/build",
   BETTER_AUTH_SECRET: "placeholder-build-secret",
   ENCRYPTION_KEY: Buffer.alloc(32).toString("base64"),
-  META_WEBHOOK_VERIFY_TOKEN: "placeholder-verify-token",
 };
 
 let cached: Env | null = null;
@@ -77,13 +73,14 @@ function stripEmpty(env: NodeJS.ProcessEnv): Record<string, string> {
 /** true si el entorno de pruebas interno (mocks) está habilitado y NO es producción. */
 export function isMockEnabled(): boolean {
   return (
-    process.env.WA_MOCK_ENABLED === "true" &&
+    process.env.MOCK_ENABLED === "true" &&
     process.env.NODE_ENV !== "production"
   );
 }
 
-/** true si hay proveedor de IA configurado (token presente y no vacío). */
+/** true when the AI provider has both credentials and a model configured. */
 export function isAiConfigured(): boolean {
-  const token = process.env.OPENROUTER_API_TOKEN;
-  return typeof token === "string" && token.trim().length > 0;
+  return [process.env.AI_API_TOKEN, process.env.AI_MODEL].every(
+    (value) => typeof value === "string" && value.trim().length > 0
+  );
 }

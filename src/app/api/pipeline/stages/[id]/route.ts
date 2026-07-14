@@ -10,7 +10,6 @@ type Params = { params: Promise<{ id: string }> };
 
 const patchSchema = z.object({
   name: z.string().trim().min(1).max(60).optional(),
-  position: z.number().int().min(0).optional(),
 });
 
 export const PATCH = withAuth(async (session, req: Request, ctx: Params) => {
@@ -23,9 +22,6 @@ export const PATCH = withAuth(async (session, req: Request, ctx: Params) => {
     .update(schema.pipelineStage)
     .set({
       ...(body.data.name !== undefined ? { name: body.data.name } : {}),
-      ...(body.data.position !== undefined
-        ? { position: body.data.position }
-        : {}),
     })
     .where(
       scoped(

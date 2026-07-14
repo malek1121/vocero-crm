@@ -1,10 +1,9 @@
 /**
- * Limitación de tasa in-process por clave (IP) con ventana deslizante
- * (FR-062). Suficiente para el monolito de una instancia; sin Redis
- * (Constitución II).
+ * In-process sliding-window rate limiting for the single-replica monolith.
+ * Expired buckets are pruned and the key count is capped to avoid memory growth.
  */
 
-type Bucket = number[]; // timestamps (ms) de los intentos
+type Bucket = number[];
 
 const globalForRl = globalThis as unknown as {
   __voceroRateLimit?: Map<string, Bucket>;
@@ -17,6 +16,15 @@ function store(): Map<string, Bucket> {
   return globalForRl.__voceroRateLimit;
 }
 
+export const RATE_LIMIT_MAX_KEYS = 10_000;
+const PRUNE_AT_KEYS = 256;
+
+function pruneExpired(buckets: Map<string, Bucket>, cutoff: number): void {
+  for (const [key, timestamps] of buckets) {
+    if (timestamps.every((timestamp) => timestamp <= cutoff)) buckets.delete(key);
+  }
+}
+
 export type RateLimitResult = { allowed: boolean; remaining: number };
 
 export function checkRateLimit(
@@ -26,21 +34,31 @@ export function checkRateLimit(
 ): RateLimitResult {
   const buckets = store();
   const cutoff = now - opts.windowMs;
-  const bucket = (buckets.get(key) ?? []).filter((t) => t > cutoff);
 
+  if (buckets.size >= PRUNE_AT_KEYS) pruneExpired(buckets, cutoff);
+  if (!buckets.has(key) && buckets.size >= RATE_LIMIT_MAX_KEYS) {
+    const oldestKey = buckets.keys().next().value as string | undefined;
+    if (oldestKey) buckets.delete(oldestKey);
+  }
+
+  const bucket = (buckets.get(key) ?? []).filter((timestamp) => timestamp > cutoff);
   if (bucket.length >= opts.max) {
     buckets.set(key, bucket);
     return { allowed: false, remaining: 0 };
   }
+
   bucket.push(now);
   buckets.set(key, bucket);
   return { allowed: true, remaining: opts.max - bucket.length };
 }
 
-/** Solo para tests. */
+/** Test-only observability for the bounded store. */
+export function rateLimitStoreSize(): number {
+  return store().size;
+}
+
 export function resetRateLimit(): void {
   store().clear();
 }
 
-/** 10 intentos / 10 minutos por IP en login y registro (FR-062). */
 export const AUTH_RATE_LIMIT = { windowMs: 10 * 60 * 1000, max: 10 };

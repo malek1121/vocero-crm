@@ -9,6 +9,7 @@ const patchSchema = z.object({
   aiEnabled: z.boolean().optional(),
   reactivate: z.boolean().optional(),
   markRead: z.boolean().optional(),
+  archived: z.boolean().optional(),
 });
 
 type Params = { params: Promise<{ id: string }> };

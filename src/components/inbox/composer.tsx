@@ -1,116 +1,103 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import { Clock3, Send } from "lucide-react";
-import type { ConversationDto, TemplateDto } from "@/lib/types";
+import { useRef, useState } from "react";
+import { Send } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { formatRemaining } from "./helpers";
-import { TemplateSender } from "./template-sender";
+import { getPendingSendRequest } from "@/components/inbox/send-request";
 
 export function Composer({
-  conversation,
   onSend,
-  onSent,
+  onTyping,
 }: {
-  conversation: ConversationDto;
-  onSend: (text: string) => Promise<string | null>;
-  onSent: () => void;
+  onSend: (text: string, idempotencyKey: string) => Promise<string | null>;
+  onTyping?: (state: "composing" | "paused") => void;
 }) {
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [templates, setTemplates] = useState<TemplateDto[]>([]);
   const taRef = useRef<HTMLTextAreaElement>(null);
+  const pendingRequestRef = useRef<{
+    text: string;
+    idempotencyKey: string;
+  } | null>(null);
+  // Throttle del "escribiendo…": composing como mucho cada 2s; paused tras 3s idle.
+  const composingSentAtRef = useRef(0);
+  const pausedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  useEffect(() => {
-    let cancelled = false;
-    fetch("/api/templates")
-      .then((r) => (r.ok ? r.json() : { templates: [] }))
-      .then((d: { templates?: TemplateDto[] }) => {
-        if (!cancelled)
-          setTemplates((d.templates ?? []).filter((t) => t.status === "approved"));
-      })
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  function signalTyping() {
+    if (!onTyping) return;
+    const now = Date.now();
+    if (now - composingSentAtRef.current > 2000) {
+      composingSentAtRef.current = now;
+      onTyping("composing");
+    }
+    if (pausedTimerRef.current) clearTimeout(pausedTimerRef.current);
+    pausedTimerRef.current = setTimeout(() => {
+      composingSentAtRef.current = 0;
+      onTyping("paused");
+    }, 3000);
+  }
+
+  function stopTyping() {
+    if (pausedTimerRef.current) clearTimeout(pausedTimerRef.current);
+    composingSentAtRef.current = 0;
+    onTyping?.("paused");
+  }
 
   function autogrow() {
-    const el = taRef.current;
-    if (!el) return;
-    el.style.height = "auto";
-    el.style.height = `${Math.min(el.scrollHeight, 120)}px`;
+    const element = taRef.current;
+    if (!element) return;
+    element.style.height = "auto";
+    element.style.height = `${Math.min(element.scrollHeight, 120)}px`;
   }
 
   async function submit() {
     const value = text.trim();
     if (!value || sending) return;
+
+    const request = getPendingSendRequest(pendingRequestRef.current, value);
+    pendingRequestRef.current = request;
+
     setSending(true);
     setError(null);
-    const err = await onSend(value);
-    setSending(false);
-    if (err) {
-      setError(err);
-      return;
-    }
-    setText("");
-    if (taRef.current) taRef.current.style.height = "auto";
-  }
+    try {
+      const sendError = await onSend(value, request.idempotencyKey);
+      if (sendError) {
+        setError(sendError);
+        return;
+      }
 
-  if (!conversation.windowOpen) {
-    return (
-      <div className="border-t bg-background px-[18px] py-3.5">
-        <div className="mb-3 flex items-start gap-2 rounded-md border border-[#ece2cf] bg-[#faf7f0] p-3 text-sm text-[#8a6d3b]">
-          <Clock3 className="mt-0.5 h-4 w-4 shrink-0" strokeWidth={1.7} />
-          <div>
-            <p className="font-medium">La ventana de 24 horas está cerrada.</p>
-            <p className="opacity-80">
-              WhatsApp solo permite texto libre dentro de las 24 horas
-              siguientes al último mensaje del cliente. Para retomar la
-              conversación, envía una plantilla aprobada.
-            </p>
-          </div>
-        </div>
-        <TemplateSender conversationId={conversation.id} onSent={onSent} />
-      </div>
-    );
+      pendingRequestRef.current = null;
+      setText("");
+      stopTyping();
+      if (taRef.current) taRef.current.style.height = "auto";
+    } catch {
+      setError("No se pudo enviar el mensaje");
+    } finally {
+      setSending(false);
+    }
   }
 
   return (
     <div className="border-t bg-background px-[18px] pb-3.5 pt-3">
-      {templates.length > 0 && (
-        <div className="mb-2.5 flex flex-wrap gap-1.5">
-          {templates.slice(0, 4).map((t) => (
-            <button
-              key={t.id}
-              className="rounded-full border bg-secondary px-3 py-1 text-xs font-medium text-text-2 transition-colors hover:border-brand-soft hover:bg-brand-tint hover:text-brand-text"
-              onClick={() => {
-                const firstName = conversation.contact.name.split(" ")[0] ?? "";
-                setText(t.body.replace(/\{\{\s*1\s*\}\}/g, firstName));
-                taRef.current?.focus();
-                setTimeout(autogrow, 0);
-              }}
-              title={t.body}
-            >
-              {t.name.replace(/_/g, " ")}
-            </button>
-          ))}
-        </div>
-      )}
       <div className="flex items-end gap-2 rounded-md border bg-background px-3 py-2 transition-shadow focus-within:border-brand focus-within:ring-[3px] focus-within:ring-brand-soft">
         <textarea
           ref={taRef}
           placeholder="Escribe una respuesta…"
           value={text}
           rows={1}
-          onChange={(e) => {
-            setText(e.target.value);
+          onChange={(event) => {
+            const nextText = event.target.value;
+            setText(nextText);
+            if (pendingRequestRef.current?.text !== nextText.trim()) {
+              pendingRequestRef.current = null;
+            }
+            if (nextText.trim()) signalTyping();
             autogrow();
           }}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && !event.shiftKey) {
+              event.preventDefault();
               void submit();
             }
           }}
@@ -120,20 +107,20 @@ export function Composer({
           onClick={() => void submit()}
           disabled={sending || text.trim().length === 0}
           aria-label="Enviar"
+          aria-busy={sending}
           className={cn(
             "flex h-[34px] w-[34px] shrink-0 items-center justify-center rounded-[9px] bg-brand text-white transition-opacity hover:bg-brand-hover",
             (sending || !text.trim()) && "opacity-40"
           )}
         >
-          <Send className="h-4 w-4" strokeWidth={1.7} />
+          <Send className="h-4 w-4" strokeWidth={1.7} aria-hidden="true" />
         </button>
       </div>
-      <div className="mt-1.5 flex items-center justify-between">
-        {error ? <p className="text-xs text-destructive">{error}</p> : <span />}
-        <p className="text-[11px] text-text-3">
-          Ventana abierta · quedan {formatRemaining(conversation.windowRemainingMs)}
+      {error && (
+        <p className="mt-1.5 text-xs text-destructive" role="alert">
+          {error}
         </p>
-      </div>
+      )}
     </div>
   );
 }

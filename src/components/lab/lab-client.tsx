@@ -20,6 +20,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
+import { apiRequest } from "@/lib/client-api";
 
 type Run = {
   id: string;
@@ -127,7 +128,7 @@ export function LabClient() {
           </p>
           <p className="mx-auto mt-1 max-w-md text-sm text-muted-foreground">
             El Laboratorio necesita el agente activo: agrega{" "}
-            <code className="rounded bg-secondary px-1">OPENROUTER_API_TOKEN</code> a la
+            <code className="rounded bg-secondary px-1">AI_API_TOKEN</code> a la
             instancia y vuelve aquí.
           </p>
         </div>
@@ -270,12 +271,30 @@ function HistoryList({
   );
 }
 
+function getRunErrorMessage(error: string | null): string {
+  switch (error) {
+    case "run_timeout":
+      return "La corrida superó el tiempo máximo.";
+    case "process_restarted":
+      return "La corrida fue interrumpida por un reinicio.";
+    default:
+      return "La corrida no pudo completarse.";
+  }
+}
+
 function ScoreBadge({ run }: { run: Run }) {
-  if (run.status === "running") return <Badge variant="secondary">En curso…</Badge>;
-  if (run.status === "failed") return <Badge variant="destructive">Fallida</Badge>;
-  const score = run.score ?? 0;
-  const variant = score >= 80 ? "success" : score >= 50 ? "warning" : "destructive";
-  return <Badge variant={variant}>Score {score}</Badge>;
+  if (run.status === "running") {
+    return <Badge variant="secondary">En curso…</Badge>;
+  }
+  if (run.status === "failed") {
+    return <Badge variant="destructive">Fallida</Badge>;
+  }
+  if (run.score === null) {
+    return <Badge variant="secondary">Score no disponible</Badge>;
+  }
+  const variant =
+    run.score >= 80 ? "success" : run.score >= 50 ? "warning" : "destructive";
+  return <Badge variant={variant}>Score {run.score}</Badge>;
 }
 
 function Report({
@@ -296,8 +315,7 @@ function Report({
           </div>
           {run.status === "failed" && (
             <p className="text-sm text-destructive">
-              La corrida falló: {run.error ?? "error desconocido"}. Vuelve a
-              intentarlo.
+              {getRunErrorMessage(run.error)}
             </p>
           )}
         </CardHeader>
@@ -315,8 +333,7 @@ function Report({
             </div>
             {cases.some((c) => c.status === "judge_failed") && (
               <p className="mt-3 text-xs text-[#8a6d3b]">
-                {cases.filter((c) => c.status === "judge_failed").length} caso(s) sin
-                veredicto (el juez no respondió válido); excluidos del score.
+                {cases.filter((c) => c.status === "judge_failed").length} caso(s) sin veredicto; el score no está disponible.
               </p>
             )}
           </CardContent>
@@ -410,19 +427,36 @@ function HallazgoCard({
   const [respuesta, setRespuesta] = useState(hallazgo.sugerencia?.respuesta ?? "");
   const [applied, setApplied] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   async function apply() {
     setSaving(true);
-    const res = await fetch("/api/lab/suggestions/apply", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ caseId, hallazgoIndex: index, pregunta, respuesta }),
-    }).catch(() => null);
-    setSaving(false);
-    if (res?.ok) {
+    setError(null);
+    try {
+      await apiRequest(
+        "/api/kb",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            kind: "qa",
+            question: pregunta,
+            answer: respuesta,
+          }),
+        },
+        "No se pudo guardar la sugerencia"
+      );
       setApplied(true);
       setEditing(false);
       onApplied();
+    } catch (requestError) {
+      setError(
+        requestError instanceof Error
+          ? requestError.message
+          : "No se pudo guardar la sugerencia"
+      );
+    } finally {
+      setSaving(false);
     }
   }
 
@@ -462,6 +496,7 @@ function HallazgoCard({
               onChange={(e) => setRespuesta(e.target.value)}
             />
           </div>
+          {error && <p className="text-sm text-destructive" role="alert">{error}</p>}
           <div className="flex gap-2">
             <Button
               size="sm"

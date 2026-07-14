@@ -2,15 +2,15 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 /**
  * FR-031 / FR-082: una conversación de prueba del Laboratorio JAMÁS alcanza
- * la API de WhatsApp — sendText lanza antes de cualquier llamada Graph.
+ * el canal de WhatsApp — sendText lanza antes de tocar el socket Baileys.
  */
 
-const graphRequest = vi.fn();
+const sendChannelText = vi.fn();
 
-vi.mock("@/lib/meta/client", async (importOriginal) => {
+vi.mock("@/server/baileys/manager", async (importOriginal) => {
   const original =
-    await importOriginal<typeof import("@/lib/meta/client")>();
-  return { ...original, graphRequest };
+    await importOriginal<typeof import("@/server/baileys/manager")>();
+  return { ...original, sendChannelText };
 });
 
 function makeChain(rows: unknown[]) {
@@ -29,19 +29,19 @@ vi.mock("@/lib/db", () => ({
     select: () => makeChain(selectRows.shift() ?? []),
   }),
   schema: {
-    conversation: { contactId: "contactId", id: "id" },
-    contact: { id: "id" },
+    conversation: { contactId: "contactId", id: "id", organizationId: "organizationId" },
+    contact: { id: "id", organizationId: "organizationId" },
     message: {},
   },
 }));
 
 describe("sandbox del Laboratorio en el sender", () => {
   beforeEach(() => {
-    graphRequest.mockReset();
+    sendChannelText.mockReset();
     selectRows.length = 0;
   });
 
-  it("conversación is_test → lanza sandbox_violation y NO llama a Graph", async () => {
+  it("conversación is_test → lanza sandbox_violation y NO toca el canal", async () => {
     selectRows.push([
       {
         conversation: {
@@ -60,10 +60,11 @@ describe("sandbox del Laboratorio en el sender", () => {
         conversationId: "cv_test",
         organizationId: "org_1",
         text: "hola",
+        idempotencyKey: "00000000-0000-4000-8000-000000000001",
       })
     ).rejects.toMatchObject({ code: "sandbox_violation" });
 
-    expect(graphRequest).not.toHaveBeenCalled();
+    expect(sendChannelText).not.toHaveBeenCalled();
 
     // sanity: el error es del tipo tipado
     try {
@@ -82,10 +83,11 @@ describe("sandbox del Laboratorio en el sender", () => {
         conversationId: "cv_test",
         organizationId: "org_1",
         text: "hola",
+        idempotencyKey: "00000000-0000-4000-8000-000000000001",
       });
     } catch (err) {
       expect(err).toBeInstanceOf(SendError);
     }
-    expect(graphRequest).not.toHaveBeenCalled();
+    expect(sendChannelText).not.toHaveBeenCalled();
   });
 });

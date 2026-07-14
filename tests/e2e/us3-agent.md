@@ -1,7 +1,9 @@
 # Guion E2E — US3: Agente de IA con acciones tipadas
 
 > Conducido con Playwright (MCP) contra `pnpm dev` con ai-mock
-> (`OPENROUTER_BASE_URL` → `/api/dev/ai-mock`) y `AGENT_COALESCE_MS=2000`.
+> (`AI_BASE_URL` → `/api/dev/ai-mock`, `MOCK_ENABLED=true`) y
+> `AGENT_COALESCE_MS=2000`. Los inbound llegan desde un teléfono cliente real
+> (canal Baileys conectado por QR).
 
 ## Preparación
 

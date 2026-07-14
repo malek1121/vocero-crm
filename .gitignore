@@ -20,6 +20,11 @@ build/
 
 # --- Logs y temporales ---
 *.log
+.tmp-*.err
+.tmp-*.log
+.tmp-*.pid
+*.dump
+backups/
 npm-debug.log*
 pnpm-debug.log*
 .cache/
@@ -39,3 +44,4 @@ Thumbs.db
 .claude/settings.local.json
 .playwright-mcp/
 .tmp-seed-demo.mjs
+test-results/

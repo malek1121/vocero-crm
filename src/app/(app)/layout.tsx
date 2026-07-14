@@ -1,7 +1,5 @@
 import { redirect } from "next/navigation";
-import { headers } from "next/headers";
-import { getAuth } from "@/lib/auth";
-import { getSessionOrNull } from "@/lib/auth/session";
+import { getAuthSession, getSessionOrNull } from "@/lib/auth/session";
 import { getBranding } from "@/server/branding";
 import { AppNav } from "@/components/app-nav";
 
@@ -11,9 +9,8 @@ export default async function AppLayout({
   const session = await getSessionOrNull();
   if (!session) redirect("/login");
   const branding = await getBranding(session.organizationId);
-  const authSession = await getAuth().api.getSession({
-    headers: await headers(),
-  });
+  // Deduplicado por request con requireSession (React cache): 1 solo lookup.
+  const authSession = await getAuthSession();
 
   return (
     <div className="flex h-screen overflow-hidden bg-background">
