@@ -1,14 +1,12 @@
-# Guion E2E — US7: Multi-usuario mínimo
+# Guion E2E ? US7: Multi-usuario m?nimo
 
-> Conducido con Playwright (MCP) contra `pnpm dev` (org ya creada).
+> Manual validation guide. Automated unauthenticated smoke coverage lives in `tests/e2e/browser/smoke.spec.ts`.
 
-1. **Registro cerrado (FR-060)**: POST público a sign-up con otra cuenta.
-   ✅ 403 con mensaje claro (la UI lo muestra en /register).
-2. **Escape**: `ALLOW_SIGNUP=true` reabre el registro (unit test
-   registration.test.ts; requiere reinicio con la variable).
-3. **Cuenta de equipo (FR-061)**: el owner crea una cuenta desde
-   Configuración → Equipo (email + contraseña temporal mostrada una vez).
-   ✅ El nuevo miembro puede iniciar sesión y ve la bandeja de la organización.
-   ✅ Un miembro (no owner) NO puede crear cuentas (403).
-4. **Rate limit (FR-062)**: >10 logins fallidos desde la misma IP en 10 min.
-   ✅ 429 "Demasiados intentos".
+1. **Initial registration only (FR-060)**: on an empty database, create the first owner account.
+2. **Public registration stays closed**: after the first organization exists, any second public sign-up must return 403. Environment variables cannot reopen it.
+3. **Team account (FR-061)**: the owner creates a member from Settings ? Team using an email and temporary password.
+4. **Member login**: the new member signs in and sees the organization's inbox.
+5. **Owner authorization**: a member cannot create more accounts and receives 403.
+6. **Rate limit (FR-062)**: more than 10 failed logins from the same IP within 10 minutes returns 429 without leaking account details.
+
+Do not mark this guide as executed until the owner/member flow has been repeated on the release candidate.

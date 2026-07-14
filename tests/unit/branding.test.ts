@@ -6,6 +6,15 @@ import {
   resolveAccentSet,
 } from "@/lib/branding";
 
+function contrastWithWhite(hex: string): number {
+  const channels = [1, 3, 5].map((index) => {
+    const value = parseInt(hex.slice(index, index + 2), 16) / 255;
+    return value <= 0.03928 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+  });
+  const luminance = 0.2126 * channels[0]! + 0.7152 * channels[1]! + 0.0722 * channels[2]!;
+  return 1.05 / (luminance + 0.05);
+}
+
 describe("white-label: acento", () => {
   it("preset devuelve el set exacto del handoff", () => {
     expect(resolveAccentSet("#3f5972")).toEqual(ACCENT_PRESETS["#3f5972"]!.set);
@@ -23,9 +32,7 @@ describe("white-label: acento", () => {
   it("color demasiado claro se oscurece para contraste con texto blanco", () => {
     const s = resolveAccentSet("#ffee88"); // amarillo pálido, ilegible con blanco
     expect(s.accent).not.toBe("#ffee88");
-    // el resultado debe ser notablemente más oscuro
-    const lum = parseInt(s.accent.slice(1, 3), 16);
-    expect(lum).toBeLessThan(0xd0);
+    expect(contrastWithWhite(s.accent)).toBeGreaterThanOrEqual(4.5);
   });
 
   it("hex inválido cae al default", () => {

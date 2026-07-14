@@ -44,7 +44,7 @@ describe("judgeCase (FR-032)", () => {
   });
 });
 
-describe("computeScore (FR-033: judge_failed excluido del denominador)", () => {
+describe("computeScore (FR-033: unavailable on judge failure)", () => {
   it("pondera verde=1, amarillo=0.5, rojo=0", () => {
     const score = computeScore([
       { status: "done", veredicto: "verde" },
@@ -54,13 +54,13 @@ describe("computeScore (FR-033: judge_failed excluido del denominador)", () => {
     expect(score).toBe(50); // (1 + 0.5 + 0) / 3 = 0.5
   });
 
-  it("judge_failed NO cuenta en el denominador", () => {
+  it("judge_failed makes the whole score unavailable", () => {
     const score = computeScore([
       { status: "done", veredicto: "verde" },
       { status: "done", veredicto: "verde" },
       { status: "judge_failed", veredicto: null },
     ]);
-    expect(score).toBe(100); // 2/2, no 2/3
+    expect(score).toBeNull();
   });
 
   it("todo judge_failed → sin score (null)", () => {

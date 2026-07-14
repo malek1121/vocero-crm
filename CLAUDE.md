@@ -24,51 +24,54 @@ externas: el trabajo en segundo plano (agente, Laboratorio) es in-process.
 
 | Quieres cambiar… | Toca… |
 |---|---|
-| El cerebro/proveedor LLM | `src/lib/ai/` (adaptador OpenRouter-compatible, `chatJson<T>`) |
+| El cerebro/proveedor LLM | `src/lib/ai/` (adaptador OpenAI-compatible → Cloudflare Workers AI, `chatJson<T>`) |
 | El comportamiento/prompt del agente | `src/server/ai/prompts.ts` |
 | Las acciones que puede tomar el agente | `src/server/ai/actions.ts` + ejecución en `src/server/ai/pipeline.ts` |
 | Las personas o el juez del Laboratorio | `src/server/lab/personas.ts` · `src/server/lab/judge.ts` |
-| El canal WhatsApp (Graph API) | `src/lib/meta/` (cliente único) + `src/server/whatsapp/` |
+| El canal WhatsApp (Baileys) | `src/server/baileys/` (manager singleton + auth-state cifrado + mapeos) |
 | Campos/tablas | `src/lib/db/schema.ts` → `pnpm db:generate` → migración nueva en `drizzle/` |
-| La ingesta/envío de mensajes | `src/server/inbox/` (ingest idempotente, send con guard de sandbox, ventana 24h) |
+| La ingesta/envío de mensajes | `src/server/inbox/` (ingest idempotente, send con guard de sandbox) |
 | UI | `src/components/` + `src/app/(app)/` |
 
-Los mocks del entorno de pruebas viven en `src/app/api/dev/` (wa-mock +
-ai-mock) tras un gate único (`src/lib/dev-guard.ts`): 404 incondicional en
-producción.
+El mock del entorno de pruebas vive en `src/app/api/dev/` (ai-mock) tras un
+gate único (`src/lib/dev-guard.ts`, `MOCK_ENABLED=true`): 404 incondicional
+en producción.
 
 ## Reglas de la constitución (no negociables)
 
 Ver [.specify/memory/constitution.md](.specify/memory/constitution.md).
 
-- **Soberanía (II, endurecida)**: dependencias de runtime SOLO WhatsApp Cloud
-  API + proveedor LLM OpenRouter-compatible opcional. PROHIBIDO en v1
-  introducir S3/R2, email, Stripe, Google u otros servicios externos. Auth y
-  BD self-hosted.
+- **Soberanía (II, endurecida)**: dependencias de runtime SOLO el canal
+  WhatsApp (Baileys, socket propio) + proveedor LLM OpenAI-compatible opcional
+  (Cloudflare Workers AI por defecto). PROHIBIDO en v1 introducir S3/R2,
+  email, Stripe, Google u otros servicios externos. Auth y BD self-hosted.
 - **Seguridad (I)**: secretos cifrados en reposo (AES-256-GCM, `lib/crypto`);
-  jamás al cliente ni a logs. El token de WhatsApp solo muestra sus últimos 4.
+  jamás al cliente ni a logs. La sesión de Baileys va cifrada en `baileys_auth`.
 - **Multi-tenancy (III)**: `organization_id` NOT NULL en toda tabla de dominio;
   toda query pasa por `scoped()` de `src/lib/db/tenant.ts`.
-- **Idempotencia (IV)**: webhooks dedup por `wa_message_id` UNIQUE; estados
-  monotónicos; seeds y migraciones re-ejecutables.
-- **Sandbox del Laboratorio**: las conversaciones `is_test` JAMÁS tocan la API
-  real — el sender lanza excepción (no lo "arregles": es un guardrail).
+- **Idempotencia (IV)**: eventos del canal dedup por `wa_message_id` UNIQUE;
+  estados monotónicos; seeds y migraciones re-ejecutables.
+- **Sandbox del Laboratorio**: las conversaciones `is_test` JAMÁS tocan el
+  canal real — el sender lanza excepción (no lo "arregles": es un guardrail).
+- **Riesgo aceptado**: Baileys es cliente NO oficial (posible baneo del
+  número); una sola réplica por instancia (socket singleton).
 
 ## Variables de entorno
 
 Ver `.env.example` (cada una con guía inline). Las claves: `APP_BASE_URL`,
-`DATABASE_URL`, `BETTER_AUTH_SECRET`, `ENCRYPTION_KEY` (32 bytes base64),
-`META_WEBHOOK_VERIFY_TOKEN` (segmento secreto del webhook), `META_APP_SECRET`
-(opcional, firma), y para IA:
+`DATABASE_URL`, `BETTER_AUTH_SECRET`, `ENCRYPTION_KEY` (32 bytes base64), y
+para IA (Cloudflare Workers AI, endpoint OpenAI-compatible):
 
 ```bash
-OPENROUTER_API_TOKEN=sk-or-...
-OPENROUTER_MODEL=anthropic/claude-sonnet-4.5
-OPENROUTER_JUDGE_MODEL=anthropic/claude-haiku-4.5   # opcional: juez más barato
+AI_BASE_URL=https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai
+AI_API_TOKEN=...                                    # permiso "Workers AI"
+AI_MODEL=@cf/meta/llama-3.3-70b-instruct-fp8-fast
+AI_JUDGE_MODEL=                                     # opcional: juez más barato
 ```
 
-Para el self-test local existe además el modo de pruebas interno (mocks) —
-ver `specs/001-vocero-core/quickstart.md`. Nunca actives mocks en producción.
+La conexión de WhatsApp no usa variables: QR desde la app (sesión cifrada en
+BD). Para el self-test del agente existe el ai-mock (`MOCK_ENABLED=true`).
+Nunca actives mocks en producción.
 
 ## Manejo de credenciales (obligatorio)
 
@@ -81,8 +84,9 @@ deploy, las vars van también en la plataforma de hosting (runtime, no build).
 
 "Typecheck + lint + build (+ tests)" es el piso, NO el techo. Una feature no
 está "Hecha" hasta correr el **self-test de COMPORTAMIENTO de punta a punta**
-(Playwright + mocks: `WA_MOCK_ENABLED=true`, `META_GRAPH_BASE_URL` → wa-mock,
-`OPENROUTER_BASE_URL` → ai-mock) y dejarlo verde: flujo real como usuario,
+(Playwright; para IA el ai-mock: `MOCK_ENABLED=true`, `AI_BASE_URL` →
+`/api/dev/ai-mock`; para el canal, un número de pruebas vinculado por QR con
+guardarraíles) y dejarlo verde: flujo real como usuario,
 resultado observable, y el camino infeliz degradando sin colgarse. Prohibido
 delegar la prueba al usuario. Si algo depende de un LLM/proveedor externo,
 todo turno tolera formato inesperado con extracción robusta + reintentos — un

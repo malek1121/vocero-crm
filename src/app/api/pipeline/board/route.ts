@@ -5,6 +5,8 @@ import { scoped } from "@/lib/db/tenant";
 
 export const dynamic = "force-dynamic";
 
+const BOARD_LEAD_LIMIT = 1_000;
+
 /** Datos completos del kanban: etapas ordenadas + tarjetas con su contacto. */
 export const GET = withAuth(async (session) => {
   const db = getDb();
@@ -31,7 +33,8 @@ export const GET = withAuth(async (session) => {
       )
     )
     .where(scoped(schema.lead.organizationId, session.organizationId))
-    .orderBy(asc(schema.lead.position));
+    .orderBy(asc(schema.lead.position))
+    .limit(BOARD_LEAD_LIMIT + 1);
 
   return Response.json({
     stages: stages.map((s) => ({
@@ -40,7 +43,7 @@ export const GET = withAuth(async (session) => {
       position: s.position,
       kind: s.kind,
     })),
-    leads: leads.map((r) => ({
+    leads: leads.slice(0, BOARD_LEAD_LIMIT).map((r) => ({
       id: r.lead.id,
       stageId: r.lead.stageId,
       position: r.lead.position,
@@ -52,5 +55,6 @@ export const GET = withAuth(async (session) => {
       },
       conversationId: r.conversationId,
     })),
+    truncated: leads.length > BOARD_LEAD_LIMIT,
   });
 });

@@ -2,7 +2,7 @@ import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import { getEnv } from "@/lib/env";
 
 /**
- * Cifrado en reposo de secretos (token de WhatsApp) con AES-256-GCM.
+ * Cifrado en reposo de secretos (sesión de WhatsApp) con AES-256-GCM.
  * GCM aporta integridad además de confidencialidad: si el tag no coincide,
  * el descifrado lanza (dato manipulado o clave incorrecta).
  */

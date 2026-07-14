@@ -92,7 +92,7 @@ export function resolveAccentSet(accentHex: string): AccentSet {
 
   let base = hexToRgb(accentHex.toLowerCase());
   // contraste con blanco = (1.05) / (L + 0.05); exigir ≥ 3
-  while (1.05 / (luminance(base) + 0.05) < 3 && luminance(base) > 0.005) {
+  while (1.05 / (luminance(base) + 0.05) < 4.5 && luminance(base) > 0.005) {
     base = mix(base, BLACK, 0.12);
   }
   return {

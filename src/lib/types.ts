@@ -10,8 +10,7 @@ export type ConversationDto = {
   lastInboundAt: string | null;
   lastMessageAt: string | null;
   unreadCount: number;
-  windowOpen: boolean;
-  windowRemainingMs: number;
+  archived: boolean;
   preview: string | null;
 };
 
@@ -24,16 +23,6 @@ export type MessageDto = {
   status: "pending" | "sent" | "delivered" | "read" | "failed";
   aiGenerated: boolean;
   createdAt: string;
-};
-
-export type TemplateDto = {
-  id: string;
-  name: string;
-  language: string;
-  category: string;
-  body: string;
-  status: "draft" | "pending" | "approved" | "rejected";
-  rejectionReason: string | null;
 };
 
 export type StageDto = {

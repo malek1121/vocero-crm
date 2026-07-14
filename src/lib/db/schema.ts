@@ -209,7 +209,15 @@ export const message = pgTable(
       .notNull()
       .references(() => conversation.id, { onDelete: "cascade" }),
     /** ID de WhatsApp — UNIQUE (idempotencia). Nullable en salientes de prueba. */
-    waMessageId: text("wa_message_id").unique(),
+    waMessageId: text("wa_message_id"),
+    /** UUID estable del cliente o clave determinista del dispatcher. */
+    idempotencyKey: text("idempotency_key"),
+    deliveryState: text("delivery_state", {
+      enum: ["pending", "sending", "sent", "failed"],
+    }),
+    deliveryAttempts: integer("delivery_attempts").notNull().default(0),
+    deliveryLeaseUntil: timestamp("delivery_lease_until"),
+    lastErrorCode: text("last_error_code"),
     direction: text("direction", { enum: ["in", "out"] }).notNull(),
     type: text("type").notNull().default("text"),
     text: text("text"),
@@ -221,6 +229,8 @@ export const message = pgTable(
     error: text("error"),
     aiGenerated: boolean("ai_generated").notNull().default(false),
     waTimestamp: timestamp("wa_timestamp"),
+    /** Marca que todos los efectos durables de un entrante fueron aplicados. */
+    processedAt: timestamp("processed_at"),
     createdAt: timestamp("created_at").notNull().defaultNow(),
   },
   (t) => [
@@ -229,34 +239,76 @@ export const message = pgTable(
       t.conversationId,
       t.createdAt
     ),
+    uniqueIndex("message_org_wa_uq")
+      .on(t.organizationId, t.waMessageId)
+      .where(sql`${t.waMessageId} is not null`),
+    uniqueIndex("message_org_idempotency_uq")
+      .on(t.organizationId, t.idempotencyKey)
+      .where(sql`${t.idempotencyKey} is not null`),
+    index("message_org_delivery_idx").on(
+      t.organizationId,
+      t.deliveryState,
+      t.deliveryLeaseUntil
+    ),
   ]
 );
 
-export const metaCredentials = pgTable(
-  "meta_credentials",
+/** Estado de sesión de Baileys, cifrado en reposo (spec 002, FR-B02). */
+/** Trabajo durable y acotado para el turno del agente por mensaje entrante. */
+export const agentDispatch = pgTable(
+  "agent_dispatch",
   {
     id: text("id").primaryKey(),
     organizationId: text("organization_id")
       .notNull()
       .references(() => organization.id, { onDelete: "cascade" }),
-    wabaId: text("waba_id").notNull(),
-    phoneNumberId: text("phone_number_id").notNull(),
-    displayPhoneNumber: text("display_phone_number"),
-    verifiedName: text("verified_name"),
-    tokenCipher: text("token_cipher").notNull(),
-    tokenIv: text("token_iv").notNull(),
-    tokenTag: text("token_tag").notNull(),
-    status: text("status", { enum: ["connected", "reconnect_required"] })
+    conversationId: text("conversation_id")
       .notNull()
-      .default("connected"),
+      .references(() => conversation.id, { onDelete: "cascade" }),
+    sourceMessageId: text("source_message_id")
+      .notNull()
+      .references(() => message.id, { onDelete: "cascade" }),
+    status: text("status", {
+      enum: ["pending", "processing", "completed", "failed"],
+    })
+      .notNull()
+      .default("pending"),
+    attempts: integer("attempts").notNull().default(0),
+    availableAt: timestamp("available_at").notNull().defaultNow(),
+    leaseUntil: timestamp("lease_until"),
+    lastErrorCode: text("last_error_code"),
     createdAt: timestamp("created_at").notNull().defaultNow(),
     updatedAt: timestamp("updated_at").notNull().defaultNow(),
   },
   (t) => [
-    uniqueIndex("meta_credentials_org_uq").on(t.organizationId),
-    // El webhook enruta por phone_number_id: debe ser único en la instancia.
-    uniqueIndex("meta_credentials_phone_uq").on(t.phoneNumberId),
+    uniqueIndex("agent_dispatch_org_source_uq").on(
+      t.organizationId,
+      t.sourceMessageId
+    ),
+    index("agent_dispatch_org_status_idx").on(
+      t.organizationId,
+      t.status,
+      t.availableAt,
+      t.leaseUntil
+    ),
   ]
+);
+
+export const baileysAuth = pgTable(
+  "baileys_auth",
+  {
+    id: text("id").primaryKey(),
+    organizationId: text("organization_id")
+      .notNull()
+      .references(() => organization.id, { onDelete: "cascade" }),
+    /** "creds" o "<tipo>:<id>" de las signal keys. */
+    key: text("key").notNull(),
+    valueCipher: text("value_cipher").notNull(),
+    valueIv: text("value_iv").notNull(),
+    valueTag: text("value_tag").notNull(),
+    updatedAt: timestamp("updated_at").notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex("baileys_auth_org_key_uq").on(t.organizationId, t.key)]
 );
 
 export const agentProfile = pgTable(
@@ -293,36 +345,6 @@ export const kbEntry = pgTable(
     updatedAt: timestamp("updated_at").notNull().defaultNow(),
   },
   (t) => [index("kb_org_idx").on(t.organizationId)]
-);
-
-export const template = pgTable(
-  "template",
-  {
-    id: text("id").primaryKey(),
-    organizationId: text("organization_id")
-      .notNull()
-      .references(() => organization.id, { onDelete: "cascade" }),
-    name: text("name").notNull(),
-    language: text("language").notNull(),
-    category: text("category").notNull(),
-    body: text("body").notNull(),
-    status: text("status", {
-      enum: ["draft", "pending", "approved", "rejected"],
-    })
-      .notNull()
-      .default("draft"),
-    rejectionReason: text("rejection_reason"),
-    waTemplateId: text("wa_template_id"),
-    createdAt: timestamp("created_at").notNull().defaultNow(),
-    updatedAt: timestamp("updated_at").notNull().defaultNow(),
-  },
-  (t) => [
-    uniqueIndex("template_org_name_lang_uq").on(
-      t.organizationId,
-      t.name,
-      t.language
-    ),
-  ]
 );
 
 export const agentTestRun = pgTable(

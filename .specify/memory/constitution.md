@@ -1,31 +1,28 @@
 <!--
 SYNC IMPACT REPORT
 ==================
-Versión: 1.1.0 (plantilla starter) → 1.2.0
+Versión: 1.2.0 → 2.0.0
 
-Cambios:
-  - Título y descripción del producto: Vocero CRM (CRM de WhatsApp con agente de
-    IA, open source MIT, self-hosted, gratuito; una instancia = un negocio).
-  - Principio II "Soberanía / Self-Hosted" → ENDURECIDO: se elimina la excepción
-    de almacenamiento de objetos S3-compatible; lista cerrada de dependencias
-    externas en runtime (WhatsApp Cloud API + proveedor LLM opcional vía
-    adaptador OpenRouter-compatible); prohibición explícita v1 de S3/R2, email,
-    Stripe y Google; requisitos mínimos del instalador fijados.
-  - Principio VIII "Foco Vertical" → definido: CRM de conversaciones y leads de
-    WhatsApp que las agencias despliegan para negocios.
+Cambios (enmienda 2026-07-13, aprobada por el dueño del proyecto):
+  - Principio II "Soberanía / Self-Hosted" → REDEFINIDO (incompatible): el canal
+    WhatsApp pasa de la API oficial en la nube a **Baileys** (cliente WhatsApp
+    Web no oficial, socket propio, conexión por QR, sesión cifrada en BD). El
+    proveedor LLM opcional pasa al adaptador OpenAI-compatible con
+    **Cloudflare Workers AI** por defecto (`AI_BASE_URL` / `AI_MODEL` /
+    `AI_API_TOKEN`). Riesgo aceptado y documentado: cliente no oficial →
+    posible baneo del número; instancia de réplica única (socket singleton).
+  - Restricciones de Plataforma: "cliente Graph API propio" → "manager Baileys
+    propio"; se elimina la referencia al webhook (ya no existe).
+  - Se elimina del Principio VIII la mención a la ventana de 24h (no aplica al
+    canal actual).
   - Principios I, III, IV, V, VI, VII y IX: íntegros (sin cambio semántico).
-  - Governance: Ratified / Last Amended = 2026-07-09.
 
-Bump: MINOR (1.1.0 → 1.2.0) — expansión material del Principio II y definición
-del Principio VIII; sin eliminaciones ni redefiniciones incompatibles.
+Bump: MAJOR (1.2.0 → 2.0.0) — redefinición incompatible del Principio II.
 
 Plantillas dependientes:
-  - .specify/templates/plan-template.md — ✅ compatible (Constitution Check
-    genérico; los gates se evalúan contra esta versión).
-  - .specify/templates/spec-template.md — ✅ compatible (sin secciones nuevas).
-  - .specify/templates/tasks-template.md — ✅ compatible.
-  - CLAUDE.md — ⚠ se personaliza para el usuario final del repo en la fase de
-    implementación (tarea planificada de la feature 001).
+  - .specify/templates/* — ✅ compatibles (gates genéricos).
+  - CLAUDE.md — ✅ actualizado en la misma enmienda.
+  - specs/002-baileys-channel/ — spec de la migración de canal.
 
 TODOs diferidos: ninguno.
 -->
@@ -63,24 +60,31 @@ Vocero CRM opera completo sobre la infraestructura del operador. La lista de
 dependencias externas en runtime es CERRADA:
 
 - Dependencias externas permitidas en runtime, ÚNICAMENTE:
-  1. **WhatsApp Cloud API** (Meta Graph API) — el canal es la razón de ser del
-     producto.
+  1. **El canal WhatsApp vía Baileys** (cliente WhatsApp Web no oficial, socket
+     propio, conexión por QR) — el canal es la razón de ser del producto.
+     Riesgo aceptado por el dueño: cliente no oficial → posible baneo del
+     número; se exige número dedicado y guardarraíles anti-abuso.
   2. **El proveedor LLM**, opcional, accedido EXCLUSIVAMENTE a través del adaptador
-     OpenRouter-compatible (`OPENROUTER_BASE_URL` / `OPENROUTER_MODEL`). Sin token
+     OpenAI-compatible (`AI_BASE_URL` / `AI_MODEL` / `AI_API_TOKEN`), con
+     **Cloudflare Workers AI** como proveedor por defecto. Sin token
      configurado, el producto funciona como CRM sin agente de IA.
 - **PROHIBIDO en v1**: almacenamiento de objetos externo (S3/R2), servicios de
   email, Stripe u otro billing, y servicios de Google. Cualquier feature que los
   requiera queda fuera del alcance de v1.
-- El instalador solo necesita: un VPS con Coolify o Docker, un dominio, credenciales
-  de Meta y (opcional) un token de OpenRouter. Nada más.
+- El instalador solo necesita: un VPS con Coolify o Docker, un dominio y
+  (opcional) credenciales de Cloudflare Workers AI. Nada más. La conexión del
+  número se hace desde la app (QR); la sesión queda cifrada en la BD.
 - Las funciones core —autenticación y base de datos— corren self-hosted (Better
   Auth + PostgreSQL propios de la instancia).
 - Las integraciones externas permitidas se aíslan tras adaptadores dedicados
-  (cliente Graph API propio; adaptador LLM) para no acoplar el dominio a ellas.
+  (manager Baileys propio; adaptador LLM) para no acoplar el dominio a ellas.
+- La instancia corre en UNA réplica: la sesión de WhatsApp es un socket único.
 
 **Rationale**: El producto se regala para que agencias lo desplieguen en VPS de
 clientes; cada dependencia externa adicional es un costo, un punto de fallo y una
-fuga de soberanía que rompe la promesa "gratis y tuyo".
+fuga de soberanía que rompe la promesa "gratis y tuyo". El canal no oficial es un
+trade-off explícito: máxima soberanía (sin cuentas de plataforma) a cambio del
+riesgo de baneo, aceptado y documentado.
 
 ### III. Multi-Tenancy Real
 
@@ -159,10 +163,10 @@ herramienta de scraping. Lo que no ayude a *atender, organizar y convertir
 conversaciones de WhatsApp de UN negocio* se rechaza.
 
 - El modelo de datos y los flujos MUST reflejar ese dominio: contactos que escriben
-  por WhatsApp, conversaciones con ventana de 24h, leads en un pipeline, un agente
-  de IA que atiende con el conocimiento del negocio y escala a humanos.
-- WhatsApp Cloud API es el canal; el producto es el CRM. Features de canal que no
-  sirvan a atender/organizar/convertir (broadcast masivo, scraping de números,
+  por WhatsApp, conversaciones, leads en un pipeline, un agente de IA que atiende
+  con el conocimiento del negocio y escala a humanos.
+- WhatsApp (vía Baileys) es el canal; el producto es el CRM. Features de canal que
+  no sirvan a atender/organizar/convertir (broadcast masivo, scraping de números,
   flujos visuales genéricos) quedan FUERA del alcance de v1.
 - Toda feature MUST servir a la agencia que despliega o al negocio que opera UNA
   instancia. Lo que solo sirva a una plataforma centralizada (billing, planes,
@@ -190,8 +194,8 @@ el piso, no el techo.
   devuelva 2xx, ni con inspeccionar la base de datos: se observa el resultado de cara al
   usuario.
 - **Local primero, nube después.** Si el comportamiento puede reproducirse en `localhost`
-  —incluyendo integraciones externas vía túnel (p. ej. ngrok + handshake del webhook desde
-  el panel del proveedor)—, SHOULD probarse ahí antes de desplegar. El deploy a la nube se
+  —incluyendo integraciones externas (p. ej. un número de pruebas vinculado por
+  QR)—, SHOULD probarse ahí antes de desplegar. El deploy a la nube se
   reserva para lo que el entorno local no pueda reproducir, porque desplegar consume tiempo
   y reduce la agilidad del ciclo.
 - **Guardarraíles con herramientas no oficiales.** Cuando la prueba use herramientas no
@@ -217,9 +221,9 @@ Estas restricciones derivan de los Principios I y II y son verificables en revis
   almacenamiento en claro de secretos es una violación.
 - **Frontera de tenant**: la capa de acceso a datos exige el identificador
   de tenant; cualquier acceso que pueda omitirlo requiere justificación explícita.
-- **Aislamiento de integraciones**: las dependencias de APIs externas se acceden a
-  través de adaptadores dedicados (cliente Graph API propio, adaptador LLM
-  OpenRouter-compatible), no dispersas por el dominio.
+- **Aislamiento de integraciones**: las dependencias externas se acceden a
+  través de adaptadores dedicados (manager Baileys propio, adaptador LLM
+  OpenAI-compatible), no dispersas por el dominio.
 - **Instancia pública endurecida**: las rutas de mock/desarrollo devuelven 404
   incondicional en producción; el registro se cierra tras la primera organización
   (salvo habilitación explícita); los entornos de prueba internos JAMÁS alcanzan la
@@ -260,4 +264,4 @@ práctica, convención o preferencia; ante un conflicto, gana la constitución.
 - **Propagación**: al enmendar la constitución se revisan y, si procede, se actualizan
   las plantillas dependientes (plan, spec, tasks).
 
-**Version**: 1.2.0 | **Ratified**: 2026-07-09 | **Last Amended**: 2026-07-09
+**Version**: 2.0.0 | **Ratified**: 2026-07-09 | **Last Amended**: 2026-07-13

@@ -2,10 +2,11 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
-import { PanelRight } from "lucide-react";
+import { Archive, ArchiveRestore, Loader2, PanelRight } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { ContactAvatar } from "@/components/avatar";
 import type { ConversationDto, MessageDto } from "@/lib/types";
+import { apiRequest } from "@/lib/client-api";
 import { useEvents } from "@/components/use-events";
 import { ConversationList } from "./conversation-list";
 import { MessageThread } from "./message-thread";
@@ -18,10 +19,32 @@ export function InboxClient() {
   );
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [messages, setMessages] = useState<MessageDto[]>([]);
+  const [conversationCursor, setConversationCursor] = useState<string | null>(null);
+  const [messageCursor, setMessageCursor] = useState<string | null>(null);
+  const [loadingMoreConversations, setLoadingMoreConversations] = useState(false);
+  const [loadingOlderMessages, setLoadingOlderMessages] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [panelOpen, setPanelOpen] = useState(true);
   // Se incrementa con cada evento SSE que puede cambiar la etapa/lead o el
   // estado del agente: el panel de detalles lo observa y refetch en vivo.
   const [detailRev, setDetailRev] = useState(0);
+  // Progreso de sync de historial al vincular (spec 004 FR-402); null = sin sync.
+  const [syncProgress, setSyncProgress] = useState<number | null>(null);
+  // Filtro Activas/Archivadas (spec 004 FR-421).
+  const [showArchived, setShowArchived] = useState(false);
+  // Teléfono del contacto que está "escribiendo…" (spec 004 FR-412).
+  const [typingPhone, setTypingPhone] = useState<string | null>(null);
+  const typingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    // Semilla: si el sync ya arrancó cuando se abre la Bandeja.
+    fetch("/api/settings/whatsapp", { cache: "no-store" })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d: { syncProgress?: number | null } | null) => {
+        if (d && typeof d.syncProgress === "number") setSyncProgress(d.syncProgress);
+      })
+      .catch(() => {});
+  }, []);
 
   useEffect(() => {
     setPanelOpen(localStorage.getItem("vocero.panelOpen") !== "false");
@@ -32,24 +55,90 @@ export function InboxClient() {
   }, []);
   const selectedIdRef = useRef<string | null>(null);
   selectedIdRef.current = selectedId;
-  const lastFetchRef = useRef<string | null>(null);
-
   const refetchConversations = useCallback(async () => {
-    const res = await fetch("/api/conversations").catch(() => null);
-    if (!res?.ok) return;
-    const data = (await res.json()) as { conversations: ConversationDto[] };
-    setConversations(data.conversations);
-    lastFetchRef.current = new Date().toISOString();
-  }, []);
+    const url = showArchived ? "/api/conversations?archived=1" : "/api/conversations";
+    try {
+      const data = await apiRequest<{ conversations: ConversationDto[]; nextCursor: string | null }>(
+        url,
+        { cache: "no-store" },
+        "No se pudieron cargar las conversaciones"
+      );
+      setConversations(data.conversations);
+      setConversationCursor(data.nextCursor);
+      setError(null);
+    } catch (requestError) {
+      setConversations((current) => current ?? []);
+      setError(requestError instanceof Error ? requestError.message : "No se pudieron cargar las conversaciones");
+    }
+  }, [showArchived]);
+
+  const loadMoreConversations = useCallback(async () => {
+    if (!conversationCursor || loadingMoreConversations) return;
+    setLoadingMoreConversations(true);
+    try {
+      const params = new URLSearchParams({ before: conversationCursor });
+      if (showArchived) params.set("archived", "1");
+      const data = await apiRequest<{ conversations: ConversationDto[]; nextCursor: string | null }>(
+        `/api/conversations?${params}`,
+        { cache: "no-store" },
+        "No se pudieron cargar m?s conversaciones"
+      );
+      setConversations((current) => {
+        const known = new Set((current ?? []).map((conversation) => conversation.id));
+        return [...(current ?? []), ...data.conversations.filter((conversation) => !known.has(conversation.id))];
+      });
+      setConversationCursor(data.nextCursor);
+      setError(null);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "No se pudieron cargar m?s conversaciones");
+    } finally {
+      setLoadingMoreConversations(false);
+    }
+  }, [conversationCursor, loadingMoreConversations, showArchived]);
 
   const refetchMessages = useCallback(async (conversationId: string) => {
-    const res = await fetch(
-      `/api/conversations/${conversationId}/messages`
-    ).catch(() => null);
-    if (!res?.ok) return;
-    const data = (await res.json()) as { messages: MessageDto[] };
-    if (selectedIdRef.current === conversationId) setMessages(data.messages);
+    try {
+      const data = await apiRequest<{ messages: MessageDto[]; nextCursor: string | null }>(
+        `/api/conversations/${conversationId}/messages`,
+        { cache: "no-store" },
+        "No se pudieron cargar los mensajes"
+      );
+      if (selectedIdRef.current === conversationId) {
+        setMessages(data.messages);
+        setMessageCursor(data.nextCursor);
+      }
+      setError(null);
+    } catch (requestError) {
+      if (selectedIdRef.current === conversationId) {
+        setError(requestError instanceof Error ? requestError.message : "No se pudieron cargar los mensajes");
+      }
+    }
   }, []);
+
+  const loadOlderMessages = useCallback(async () => {
+    const conversationId = selectedIdRef.current;
+    if (!conversationId || !messageCursor || loadingOlderMessages) return;
+    setLoadingOlderMessages(true);
+    try {
+      const data = await apiRequest<{ messages: MessageDto[]; nextCursor: string | null }>(
+        `/api/conversations/${conversationId}/messages?before=${encodeURIComponent(messageCursor)}`,
+        { cache: "no-store" },
+        "No se pudieron cargar los mensajes anteriores"
+      );
+      if (selectedIdRef.current === conversationId) {
+        setMessages((current) => {
+          const known = new Set(current.map((message) => message.id));
+          return [...data.messages.filter((message) => !known.has(message.id)), ...current];
+        });
+        setMessageCursor(data.nextCursor);
+      }
+      setError(null);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "No se pudieron cargar los mensajes anteriores");
+    } finally {
+      setLoadingOlderMessages(false);
+    }
+  }, [loadingOlderMessages, messageCursor]);
 
   useEffect(() => {
     void refetchConversations();
@@ -59,6 +148,13 @@ export function InboxClient() {
     (id: string) => {
       setSelectedId(id);
       setMessages([]);
+      setMessageCursor(null);
+      // Selección en la URL (spec 003 FR-P02): replaceState nativo = shallow,
+      // no re-renderiza el server; al volver a /inbox se restaura.
+      const url = new URL(window.location.href);
+      url.searchParams.set("c", id);
+      url.searchParams.delete("contact");
+      window.history.replaceState(null, "", url);
       void refetchMessages(id);
       void fetch(`/api/conversations/${id}`, {
         method: "PATCH",
@@ -69,14 +165,24 @@ export function InboxClient() {
     [refetchMessages]
   );
 
-  // Enlace directo desde Contactos/Pipeline: /inbox?contact=<id>
+  // Deep-links: /inbox?c=<conversationId> (selección persistida) y
+  // /inbox?contact=<contactId> (enlace desde Contactos/Pipeline).
   const searchParams = useSearchParams();
   const contactParam = searchParams.get("contact");
+  const conversationParam = searchParams.get("c");
   useEffect(() => {
-    if (!contactParam || selectedIdRef.current) return;
-    const match = conversations?.find((c) => c.contact.id === contactParam);
-    if (match) select(match.id);
-  }, [contactParam, conversations, select]);
+    if (selectedIdRef.current || !conversations) return;
+    if (conversationParam) {
+      if (conversations.some((c) => c.id === conversationParam)) {
+        select(conversationParam);
+      }
+      return;
+    }
+    if (contactParam) {
+      const match = conversations.find((c) => c.contact.id === contactParam);
+      if (match) select(match.id);
+    }
+  }, [conversationParam, contactParam, conversations, select]);
 
   useEvents({
     onMessageNew: ({ conversationId, message }) => {
@@ -114,19 +220,37 @@ export function InboxClient() {
       if (selectedIdRef.current) void refetchMessages(selectedIdRef.current);
       setDetailRev((v) => v + 1);
     },
+    onChannelSync: ({ progress, inserted }) => {
+      setSyncProgress(progress);
+      // Cada lote histórico ingerido trae conversaciones nuevas a la lista.
+      if (inserted > 0) void refetchConversations();
+    },
+    onPresence: ({ phone, composing }) => {
+      if (typingTimerRef.current) clearTimeout(typingTimerRef.current);
+      if (!composing) {
+        setTypingPhone(null);
+        return;
+      }
+      setTypingPhone(phone);
+      // Auto-expira: WhatsApp no siempre manda "paused" al dejar de escribir.
+      typingTimerRef.current = setTimeout(() => setTypingPhone(null), 6000);
+    },
   });
 
   const selected = conversations?.find((c) => c.id === selectedId) ?? null;
 
   const sendText = useCallback(
-    async (text: string): Promise<string | null> => {
+    async (
+      text: string,
+      idempotencyKey: string
+    ): Promise<string | null> => {
       if (!selectedIdRef.current) return "Sin conversación seleccionada";
       const res = await fetch(
         `/api/conversations/${selectedIdRef.current}/messages`,
         {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ text }),
+          body: JSON.stringify({ text, idempotencyKey }),
         }
       ).catch(() => null);
       if (!res) return "Sin conexión con el servidor";
@@ -144,27 +268,106 @@ export function InboxClient() {
   );
 
   const patchConversation = useCallback(
-    async (patch: { aiEnabled?: boolean; reactivate?: boolean }) => {
-      if (!selectedIdRef.current) return;
-      await fetch(`/api/conversations/${selectedIdRef.current}`, {
-        method: "PATCH",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(patch),
-      }).catch(() => null);
-      void refetchConversations();
+    async (patch: {
+      aiEnabled?: boolean;
+      reactivate?: boolean;
+      archived?: boolean;
+    }): Promise<boolean> => {
+      const conversationId = selectedIdRef.current;
+      if (!conversationId) return false;
+      try {
+        await apiRequest(
+          `/api/conversations/${conversationId}`,
+          {
+            method: "PATCH",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(patch),
+          },
+          "No se pudo actualizar la conversaci?n"
+        );
+        await refetchConversations();
+        setError(null);
+        return true;
+      } catch (requestError) {
+        setError(requestError instanceof Error ? requestError.message : "No se pudo actualizar la conversaci?n");
+        return false;
+      }
     },
     [refetchConversations]
   );
 
+  const emitTyping = useCallback((state: "composing" | "paused") => {
+    const id = selectedIdRef.current;
+    if (!id) return;
+    void fetch(`/api/conversations/${id}/typing`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ state }),
+    }).catch(() => {});
+  }, []);
+
+  const toggleArchive = useCallback(async () => {
+    if (!selected) return;
+    // Al (des)archivar, la conversación sale del filtro actual: limpiar selección.
+    const updated = await patchConversation({ archived: !selected.archived });
+    if (!updated) return;
+    setSelectedId(null);
+    setMessages([]);
+    setMessageCursor(null);
+  }, [selected, patchConversation]);
+
   return (
-    <div className="flex h-full">
-      <section className="w-[360px] shrink-0 overflow-hidden border-r">
-        <ConversationList
-          conversations={conversations}
-          selectedId={selectedId}
-          onSelect={select}
-          onSeeded={() => void refetchConversations()}
-        />
+    <div className="relative flex h-full">
+      {syncProgress !== null && (
+        <div
+          className="absolute inset-x-0 top-0 z-20 flex items-center gap-3 border-b bg-brand-tint px-4 py-2 text-sm"
+          role="status"
+          aria-live="polite"
+        >
+          <Loader2 className="h-4 w-4 shrink-0 animate-spin text-brand" strokeWidth={1.8} />
+          <span className="shrink-0 font-medium text-brand-text">
+            Cargando mensajes… {Math.round(syncProgress)}%
+          </span>
+          <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-brand-soft">
+            <div
+              className="h-full rounded-full bg-brand transition-[width] duration-300"
+              style={{ width: `${Math.round(syncProgress)}%` }}
+            />
+          </div>
+        </div>
+      )}
+      <section className="flex w-[360px] shrink-0 flex-col overflow-hidden border-r">
+        <div className="flex gap-1 border-b bg-background p-2">
+          {([false, true] as const).map((archived) => (
+            <button
+              key={String(archived)}
+              onClick={() => {
+                setShowArchived(archived);
+                setSelectedId(null);
+                setMessages([]);
+              }}
+              className={cn(
+                "flex-1 rounded-sm px-3 py-1.5 text-xs font-medium transition-colors",
+                showArchived === archived
+                  ? "bg-brand-tint text-brand-text"
+                  : "text-text-3 hover:bg-accent"
+              )}
+            >
+              {archived ? "Archivadas" : "Activas"}
+            </button>
+          ))}
+        </div>
+        <div className="min-h-0 flex-1 overflow-hidden">
+          <ConversationList
+            conversations={conversations}
+            selectedId={selectedId}
+            onSelect={select}
+            onSeeded={() => void refetchConversations()}
+            hasMore={Boolean(conversationCursor)}
+            loadingMore={loadingMoreConversations}
+            onLoadMore={() => void loadMoreConversations()}
+          />
+        </div>
       </section>
 
       <section className="flex min-w-0 flex-1 flex-col">
@@ -181,39 +384,46 @@ export function InboxClient() {
                   <p className="text-[15px] font-[650] leading-tight">
                     {selected.contact.name}
                   </p>
-                  <p
-                    className={
-                      selected.windowOpen
-                        ? "text-xs font-medium text-success"
-                        : "text-xs text-text-3"
-                    }
-                  >
-                    {selected.windowOpen
-                      ? "ventana abierta"
-                      : `+${selected.contact.phone}`}
-                  </p>
+                  {typingPhone === selected.contact.phone ? (
+                    <p className="text-xs font-medium text-brand">escribiendo…</p>
+                  ) : (
+                    <p className="text-xs text-text-3">
+                      +{selected.contact.phone}
+                    </p>
+                  )}
                 </div>
               </div>
-              {!panelOpen && (
+              <div className="flex items-center gap-1.5">
                 <button
-                  onClick={() => togglePanel(true)}
-                  aria-label="Mostrar detalles"
+                  onClick={() => void toggleArchive()}
+                  aria-label={selected.archived ? "Desarchivar" : "Archivar"}
+                  title={selected.archived ? "Desarchivar" : "Archivar"}
                   className="rounded-sm border p-1.5 text-text-3 hover:bg-accent hover:text-foreground"
                 >
-                  <PanelRight className="h-4 w-4" strokeWidth={1.7} />
+                  {selected.archived ? (
+                    <ArchiveRestore className="h-4 w-4" strokeWidth={1.7} />
+                  ) : (
+                    <Archive className="h-4 w-4" strokeWidth={1.7} />
+                  )}
                 </button>
-              )}
+                {!panelOpen && (
+                  <button
+                    onClick={() => togglePanel(true)}
+                    aria-label="Mostrar detalles"
+                    className="rounded-sm border p-1.5 text-text-3 hover:bg-accent hover:text-foreground"
+                  >
+                    <PanelRight className="h-4 w-4" strokeWidth={1.7} />
+                  </button>
+                )}
+              </div>
             </header>
-            <MessageThread messages={messages} />
-            <Composer
-              conversation={selected}
-              onSend={sendText}
-              onSent={() => {
-                if (selectedIdRef.current)
-                  void refetchMessages(selectedIdRef.current);
-                void refetchConversations();
-              }}
+            <MessageThread
+              messages={messages}
+              hasOlder={Boolean(messageCursor)}
+              loadingOlder={loadingOlderMessages}
+              onLoadOlder={() => void loadOlderMessages()}
             />
+            <Composer onSend={sendText} onTyping={emitTyping} />
           </>
         ) : (
           <div className="flex flex-1 items-center justify-center bg-chat text-sm text-text-3">
@@ -221,6 +431,15 @@ export function InboxClient() {
           </div>
         )}
       </section>
+
+      {error && (
+        <p
+          role="alert"
+          className="absolute bottom-4 left-1/2 z-30 -translate-x-1/2 rounded-md border border-destructive/30 bg-background px-4 py-2 text-sm text-destructive shadow-lg"
+        >
+          {error}
+        </p>
+      )}
 
       <section
         className={cn(

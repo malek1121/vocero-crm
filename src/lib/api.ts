@@ -29,8 +29,8 @@ export function withAuth<Args extends unknown[]>(
     }
     try {
       return await handler(session, ...args);
-    } catch (err) {
-      console.error("[api] error no controlado:", err);
+    } catch {
+      console.error("[api] unhandled_error");
       return apiError(500, "internal", "Error interno");
     }
   };

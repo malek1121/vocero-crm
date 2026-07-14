@@ -1,7 +1,18 @@
 import { and, eq } from "drizzle-orm";
 import { getDb, schema } from "@/lib/db";
 import { publish } from "@/server/events/bus";
-import type { WebhookStatus } from "@/server/inbox/webhook";
+import {
+  getStatusPersistence,
+  type MessageStatus,
+} from "@/server/inbox/status-state";
+
+/** Actualización de estado de un mensaje saliente (acks del canal). */
+export type StatusUpdate = {
+  id: string;
+  status: string;
+  timestamp: string;
+  errors?: { code: number; title?: string; message?: string }[];
+};
 
 /** Orden monotónico de estados: nunca degradar (un delivered tardío no pisa read). */
 const STATUS_RANK: Record<string, number> = {
@@ -11,7 +22,7 @@ const STATUS_RANK: Record<string, number> = {
   read: 3,
 };
 
-type MessageStatus = "pending" | "sent" | "delivered" | "read" | "failed";
+
 
 export function isUpgrade(current: string, next: string): boolean {
   if (next === "failed") return current !== "failed";
@@ -23,7 +34,7 @@ export function isUpgrade(current: string, next: string): boolean {
 
 export async function applyStatusUpdate(
   organizationId: string,
-  status: WebhookStatus
+  status: StatusUpdate
 ): Promise<void> {
   const next = status.status;
   if (!(next in STATUS_RANK) && next !== "failed") return; // estado desconocido
@@ -47,16 +58,11 @@ export async function applyStatusUpdate(
   if (!msg) return;
   if (!isUpgrade(msg.status, next)) return;
 
-  const error =
-    next === "failed"
-      ? (status.errors?.[0]?.message ??
-        status.errors?.[0]?.title ??
-        "Envío fallido")
-      : null;
+  const persistence = getStatusPersistence(next as MessageStatus);
 
   await db
     .update(schema.message)
-    .set({ status: next as MessageStatus, error })
+    .set(persistence)
     .where(eq(schema.message.id, msg.id));
 
   publish(organizationId, {

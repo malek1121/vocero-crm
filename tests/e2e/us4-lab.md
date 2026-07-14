@@ -5,8 +5,9 @@
 
 ## Preparación
 
-1. `DELETE /api/dev/wa-mock/outbox` — el outbox debe seguir VACÍO al final.
-2. Agente configurado (US3) y proveedor de IA (mock) activo.
+1. Agente configurado (US3) y proveedor de IA (mock) activo.
+2. El sandbox jamás toca el canal real: el guard lanza excepción antes del
+   socket (cubierto por unit tests `send-sandbox` y `lab-sandbox`).
 
 ## Corrida 1
 
@@ -18,7 +19,8 @@
    "Pregunta fuera del conocimiento" con hallazgo `fuera_de_kb`, evidencia y
    sugerencia; transcript visible por persona.
    ✅ La persona "Pide un humano" terminó en handoff (guion cortado).
-   ✅ `GET /api/dev/wa-mock/outbox` → VACÍO (ningún mensaje salió a WhatsApp).
+   ✅ Ningún mensaje salió a WhatsApp (guard de sandbox; el teléfono cliente
+   no recibe nada durante la corrida).
    ✅ Las conversaciones de prueba NO aparecen en la bandeja.
 
 ## Cerrar el loop

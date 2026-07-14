@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { Search, Sparkles, UserRound } from "lucide-react";
+import { Loader2, Search, Sparkles, UserRound } from "lucide-react";
 import type { ConversationDto } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { ContactAvatar } from "@/components/avatar";
@@ -57,11 +57,17 @@ export function ConversationList({
   selectedId,
   onSelect,
   onSeeded,
+  hasMore,
+  loadingMore,
+  onLoadMore,
 }: {
   conversations: ConversationDto[] | null;
   selectedId: string | null;
   onSelect: (id: string) => void;
   onSeeded: () => void;
+  hasMore: boolean;
+  loadingMore: boolean;
+  onLoadMore: () => void;
 }) {
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<"all" | "unread">("all");
@@ -91,6 +97,7 @@ export function ConversationList({
         <div className="flex items-center gap-2 rounded-md border bg-secondary px-3 py-[7px] transition-colors focus-within:border-brand focus-within:bg-background focus-within:ring-[3px] focus-within:ring-brand-soft">
           <Search className="h-4 w-4 shrink-0 text-text-3" strokeWidth={1.7} />
           <input
+            aria-label="Buscar conversaciones"
             placeholder="Buscar conversación…"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
@@ -157,9 +164,6 @@ export function ConversationList({
                   >
                     <span className="relative shrink-0">
                       <ContactAvatar name={c.contact.name} seed={c.contact.id} size="lg" />
-                      {c.windowOpen && (
-                        <span className="absolute bottom-0 right-0 h-[11px] w-[11px] rounded-full border-[2.5px] border-background bg-success" />
-                      )}
                     </span>
                     <span className="min-w-0 flex-1">
                       <span className="flex items-center justify-between gap-2">
@@ -220,6 +224,20 @@ export function ConversationList({
               );
             })}
           </ul>
+        )}
+        {hasMore && visible.length > 0 && (
+          <div className="flex justify-center p-3">
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              disabled={loadingMore}
+              onClick={onLoadMore}
+            >
+              {loadingMore && <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />}
+              {loadingMore ? "Cargando?" : "Cargar m?s"}
+            </Button>
+          </div>
         )}
       </div>
     </div>

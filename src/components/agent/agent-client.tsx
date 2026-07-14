@@ -8,6 +8,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
+import { apiRequest } from "@/lib/client-api";
 
 type Profile = {
   enabled: boolean;
@@ -32,19 +33,26 @@ export function AgentClient() {
   const [entries, setEntries] = useState<KbEntry[]>([]);
   const [kbSize, setKbSize] = useState<{ chars: number; warnAt: number; warning: boolean } | null>(null);
   const [saved, setSaved] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const refetch = useCallback(async () => {
-    const [p, kb, size] = await Promise.all([
-      fetch("/api/agent/profile").then((r) => (r.ok ? r.json() : null)),
-      fetch("/api/kb").then((r) => (r.ok ? r.json() : null)),
-      fetch("/api/kb/size").then((r) => (r.ok ? r.json() : null)),
-    ]).catch(() => [null, null, null]);
+    const [p, kb] = await Promise.all([
+      fetch("/api/agent/profile").then((response) =>
+        response.ok ? response.json() : null
+      ),
+      fetch("/api/kb").then((response) =>
+        response.ok ? response.json() : null
+      ),
+    ]).catch(() => [null, null]);
     if (p) {
       setProfile(p.profile);
       setAiConfigured(p.aiConfigured);
     }
-    if (kb) setEntries(kb.entries);
-    if (size) setKbSize(size);
+    if (kb) {
+      setEntries(kb.entries);
+      setKbSize(kb.size);
+    }
+    if (!p || !kb) setError("No se pudo cargar la configuración del agente");
   }, []);
 
   useEffect(() => {
@@ -53,21 +61,43 @@ export function AgentClient() {
 
   if (!profile) {
     return (
-      <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
-        Cargando…
+      <div className="flex h-full flex-col items-center justify-center gap-3 text-sm text-muted-foreground">
+        {error ? (
+          <>
+            <p className="text-destructive" role="alert">{error}</p>
+            <Button size="sm" variant="outline" onClick={() => void refetch()}>
+              Intentar nuevamente
+            </Button>
+          </>
+        ) : (
+          <p role="status">Cargando?</p>
+        )}
       </div>
     );
   }
 
   async function saveProfile(patch: Partial<Profile>) {
-    await fetch("/api/agent/profile", {
-      method: "PUT",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(patch),
-    }).catch(() => null);
-    setSaved(true);
-    setTimeout(() => setSaved(false), 2000);
-    void refetch();
+    setError(null);
+    try {
+      await apiRequest(
+        "/api/agent/profile",
+        {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(patch),
+        },
+        "No se pudo guardar el agente"
+      );
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+      await refetch();
+    } catch (requestError) {
+      setError(
+        requestError instanceof Error
+          ? requestError.message
+          : "No se pudo guardar el agente"
+      );
+    }
   }
 
   return (
@@ -98,13 +128,17 @@ export function AgentClient() {
         </div>
       </header>
 
+      {error && (
+        <p className="mx-6 mt-4 text-sm text-destructive" role="alert">{error}</p>
+      )}
+
       {!aiConfigured && (
         <div className="mx-6 mt-6 rounded-lg border border-brand-soft bg-brand-tint p-6 text-center">
           <Sparkles className="mx-auto mb-2 h-8 w-8 text-primary" />
           <p className="font-medium">Configura tu proveedor de IA para activar el agente</p>
           <p className="mx-auto mt-1 max-w-md text-sm text-muted-foreground">
-            Agrega <code className="rounded bg-secondary px-1">OPENROUTER_API_TOKEN</code> y{" "}
-            <code className="rounded bg-secondary px-1">OPENROUTER_MODEL</code> a las variables
+            Agrega <code className="rounded bg-secondary px-1">AI_API_TOKEN</code> y{" "}
+            <code className="rounded bg-secondary px-1">AI_MODEL</code> a las variables
             de entorno de la instancia y reiníciala. Mientras tanto puedes dejar listo el
             comportamiento y el conocimiento aquí abajo.
           </p>
@@ -113,7 +147,12 @@ export function AgentClient() {
 
       <div className="grid gap-6 p-6 lg:grid-cols-2">
         <ProfileSection profile={profile} onSave={saveProfile} />
-        <KbSection entries={entries} kbSize={kbSize} onChanged={() => void refetch()} />
+        <KbSection
+          entries={entries}
+          kbSize={kbSize}
+          onChanged={() => void refetch()}
+          onError={setError}
+        />
       </div>
     </div>
   );
@@ -194,10 +233,12 @@ function KbSection({
   entries,
   kbSize,
   onChanged,
+  onError,
 }: {
   entries: KbEntry[];
   kbSize: { chars: number; warnAt: number; warning: boolean } | null;
   onChanged: () => void;
+  onError: (message: string | null) => void;
 }) {
   const [question, setQuestion] = useState("");
   const [answer, setAnswer] = useState("");
@@ -205,30 +246,57 @@ function KbSection({
 
   async function addQa() {
     if (!question.trim() || !answer.trim()) return;
-    await fetch("/api/kb", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ kind: "qa", question, answer }),
-    }).catch(() => null);
-    setQuestion("");
-    setAnswer("");
-    onChanged();
+    onError(null);
+    try {
+      await apiRequest(
+        "/api/kb",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ kind: "qa", question, answer }),
+        },
+        "No se pudo agregar la pregunta"
+      );
+      setQuestion("");
+      setAnswer("");
+      onChanged();
+    } catch (requestError) {
+      onError(requestError instanceof Error ? requestError.message : "No se pudo agregar la pregunta");
+    }
   }
 
   async function addBlock() {
     if (!block.trim()) return;
-    await fetch("/api/kb", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ kind: "block", content: block }),
-    }).catch(() => null);
-    setBlock("");
-    onChanged();
+    onError(null);
+    try {
+      await apiRequest(
+        "/api/kb",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ kind: "block", content: block }),
+        },
+        "No se pudo agregar el bloque"
+      );
+      setBlock("");
+      onChanged();
+    } catch (requestError) {
+      onError(requestError instanceof Error ? requestError.message : "No se pudo agregar el bloque");
+    }
   }
 
   async function remove(id: string) {
-    await fetch(`/api/kb/${id}`, { method: "DELETE" }).catch(() => null);
-    onChanged();
+    onError(null);
+    try {
+      await apiRequest(
+        `/api/kb/${id}`,
+        { method: "DELETE" },
+        "No se pudo eliminar la entrada"
+      );
+      onChanged();
+    } catch (requestError) {
+      onError(requestError instanceof Error ? requestError.message : "No se pudo eliminar la entrada");
+    }
   }
 
   return (

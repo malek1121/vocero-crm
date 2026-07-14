@@ -1,140 +1,11 @@
-import { and, eq, sql } from "drizzle-orm";
+import { and, asc, eq, isNull, sql } from "drizzle-orm";
 import { getDb, schema } from "@/lib/db";
 import { newId } from "@/lib/db/ids";
 import { publish } from "@/server/events/bus";
-import { getCredentialsByPhoneNumberId } from "@/server/whatsapp/credentials";
-import type { WebhookValue } from "@/server/inbox/webhook";
-import { applyStatusUpdate } from "@/server/inbox/status";
-import { onLeadActivity } from "@/server/inbox/lead-activity";
-import { maybeRunAgentTurn } from "@/server/ai/trigger";
+import { scheduleAgentDispatch } from "@/server/ai/dispatch";
+import { applyInboundEffects } from "@/server/inbox/inbound-effects";
 
-/** Tipos de contenido soportados; el resto se ignora sin error. */
-const SUPPORTED_TYPES = new Set([
-  "text",
-  "image",
-  "audio",
-  "video",
-  "document",
-  "sticker",
-  "location",
-  "contacts",
-]);
-
-export async function getOrCreateContact(
-  organizationId: string,
-  phone: string,
-  name?: string | null
-) {
-  const db = getDb();
-  const inserted = await db
-    .insert(schema.contact)
-    .values({
-      id: newId("contact"),
-      organizationId,
-      phone,
-      name: name?.trim() || phone,
-    })
-    .onConflictDoNothing({
-      target: [schema.contact.organizationId, schema.contact.phone],
-    })
-    .returning();
-  if (inserted[0]) return { contact: inserted[0], isNew: true };
-
-  const rows = await db
-    .select()
-    .from(schema.contact)
-    .where(
-      and(
-        eq(schema.contact.organizationId, organizationId),
-        eq(schema.contact.phone, phone)
-      )
-    )
-    .limit(1);
-  const existing = rows[0];
-  if (!existing) throw new Error("contacto no encontrado tras upsert");
-
-  // Reactivar si estaba archivado (el nombre editado por el operador se respeta).
-  if (existing.archivedAt) {
-    await db
-      .update(schema.contact)
-      .set({ archivedAt: null, updatedAt: new Date() })
-      .where(eq(schema.contact.id, existing.id));
-    existing.archivedAt = null;
-  }
-  return { contact: existing, isNew: false };
-}
-
-export async function getOrCreateConversation(
-  organizationId: string,
-  contactId: string
-) {
-  const db = getDb();
-  const inserted = await db
-    .insert(schema.conversation)
-    .values({ id: newId("conversation"), organizationId, contactId })
-    .onConflictDoNothing()
-    .returning();
-  if (inserted[0]) return inserted[0];
-
-  const rows = await db
-    .select()
-    .from(schema.conversation)
-    .where(
-      and(
-        eq(schema.conversation.organizationId, organizationId),
-        eq(schema.conversation.contactId, contactId),
-        eq(schema.conversation.isTest, false)
-      )
-    )
-    .limit(1);
-  const existing = rows[0];
-  if (!existing) throw new Error("conversación no encontrada tras upsert");
-  return existing;
-}
-
-/**
- * Procesa el `value` de un cambio `messages` del webhook: mensajes entrantes
- * (idempotentes por wa_message_id) y actualizaciones de estado.
- */
-export async function processMessagesValue(value: WebhookValue): Promise<void> {
-  const phoneNumberId = value.metadata?.phone_number_id;
-  if (!phoneNumberId) return;
-
-  const credentials = await getCredentialsByPhoneNumberId(phoneNumberId);
-  if (!credentials) {
-    // Caso típico: webhook/override configurado ANTES de guardar la conexión
-    // en el wizard — el evento llega pero no hay a qué organización enrutarlo.
-    console.warn(
-      `[webhook] evento para phone_number_id desconocido (${phoneNumberId}): ` +
-        "guarda la conexión en Configuración → WhatsApp para recibir mensajes"
-    );
-    return;
-  }
-
-  const organizationId = credentials.organizationId;
-
-  for (const status of value.statuses ?? []) {
-    await applyStatusUpdate(organizationId, status);
-  }
-
-  for (const msg of value.messages ?? []) {
-    if (!SUPPORTED_TYPES.has(msg.type)) continue; // reacciones, etc.: ignorar
-    const profileName = value.contacts?.find(
-      (c) => c.wa_id === msg.from
-    )?.profile?.name;
-    await ingestInboundMessage({
-      organizationId,
-      from: msg.from,
-      profileName: profileName ?? null,
-      waMessageId: msg.id,
-      type: msg.type,
-      text: msg.text?.body ?? null,
-      timestamp: msg.timestamp,
-    });
-  }
-}
-
-export async function ingestInboundMessage(input: {
+export type InboundMessageInput = {
   organizationId: string;
   from: string;
   profileName: string | null;
@@ -142,80 +13,336 @@ export async function ingestInboundMessage(input: {
   type: string;
   text: string | null;
   timestamp: string;
-}): Promise<void> {
+};
+
+type Contact = typeof schema.contact.$inferSelect;
+type Conversation = typeof schema.conversation.$inferSelect;
+type Message = typeof schema.message.$inferSelect;
+
+export async function ingestInboundMessage(
+  input: InboundMessageInput
+): Promise<void> {
   const db = getDb();
-  const { organizationId } = input;
-
-  const { contact } = await getOrCreateContact(
-    organizationId,
-    input.from,
-    input.profileName
-  );
-  const conversation = await getOrCreateConversation(
-    organizationId,
-    contact.id
-  );
-
+  const organizationId = input.organizationId;
   const waTimestamp = toDate(input.timestamp);
+  const now = new Date();
 
-  // Idempotencia dura: mismo wa_message_id → sin efectos adicionales.
-  const inserted = await db
-    .insert(schema.message)
-    .values({
-      id: newId("message"),
-      organizationId,
-      conversationId: conversation.id,
-      waMessageId: input.waMessageId,
-      direction: "in",
-      type: input.type,
-      text: input.text,
-      status: "delivered",
-      waTimestamp,
-    })
-    .onConflictDoNothing({ target: [schema.message.waMessageId] })
-    .returning();
-  const message = inserted[0];
-  if (!message) return; // duplicado
+  const result = await db.transaction(async (tx) => {
+    const existingRows = await tx
+      .select()
+      .from(schema.message)
+      .where(
+        and(
+          eq(schema.message.organizationId, organizationId),
+          eq(schema.message.waMessageId, input.waMessageId)
+        )
+      )
+      .for("update")
+      .limit(1);
+    let existingMessage: Message | null = existingRows[0] ?? null;
+    let contact: Contact;
+    let conversation: Conversation;
 
-  await db
-    .update(schema.conversation)
-    .set({
-      lastInboundAt: waTimestamp,
-      lastMessageAt: waTimestamp,
-      unreadCount: sql`${schema.conversation.unreadCount} + 1`,
-      updatedAt: new Date(),
-    })
-    .where(eq(schema.conversation.id, conversation.id));
+    if (existingMessage) {
+      const contextRows = await tx
+        .select({
+          conversation: schema.conversation,
+          contact: schema.contact,
+        })
+        .from(schema.conversation)
+        .innerJoin(
+          schema.contact,
+          eq(schema.conversation.contactId, schema.contact.id)
+        )
+        .where(
+          and(
+            eq(schema.conversation.id, existingMessage.conversationId),
+            eq(schema.conversation.organizationId, organizationId),
+            eq(schema.contact.organizationId, organizationId)
+          )
+        )
+        .limit(1);
+      const context = contextRows[0];
+      if (!context) throw new Error("inbound_context_missing");
+      contact = context.contact;
+      conversation = context.conversation;
+    } else {
+      const insertedContacts = await tx
+        .insert(schema.contact)
+        .values({
+          id: newId("contact"),
+          organizationId,
+          phone: input.from,
+          name: input.profileName?.trim() || input.from,
+        })
+        .onConflictDoNothing()
+        .returning();
+      contact = insertedContacts[0] as Contact;
 
-  await onLeadActivity(organizationId, contact.id, waTimestamp);
+      if (!contact) {
+        const contactRows = await tx
+          .select()
+          .from(schema.contact)
+          .where(
+            and(
+              eq(schema.contact.organizationId, organizationId),
+              eq(schema.contact.phone, input.from)
+            )
+          )
+          .limit(1);
+        const found = contactRows[0];
+        if (!found) throw new Error("inbound_contact_missing");
+        contact = found;
+        if (contact.archivedAt) {
+          const reactivated = await tx
+            .update(schema.contact)
+            .set({ archivedAt: null, updatedAt: now })
+            .where(
+              and(
+                eq(schema.contact.id, contact.id),
+                eq(schema.contact.organizationId, organizationId)
+              )
+            )
+            .returning();
+          contact = reactivated[0] ?? { ...contact, archivedAt: null };
+        }
+      }
 
-  publish(organizationId, {
+      const insertedConversations = await tx
+        .insert(schema.conversation)
+        .values({ id: newId("conversation"), organizationId, contactId: contact.id })
+        .onConflictDoNothing()
+        .returning();
+      conversation = insertedConversations[0] as Conversation;
+
+      if (!conversation) {
+        const conversationRows = await tx
+          .select()
+          .from(schema.conversation)
+          .where(
+            and(
+              eq(schema.conversation.organizationId, organizationId),
+              eq(schema.conversation.contactId, contact.id),
+              eq(schema.conversation.isTest, false)
+            )
+          )
+          .limit(1);
+        const found = conversationRows[0];
+        if (!found) throw new Error("inbound_conversation_missing");
+        conversation = found;
+      }
+    }
+
+    const effects = await applyInboundEffects<Message>({
+      async insertOrLock() {
+        if (existingMessage) return existingMessage;
+
+        const insertedMessages = await tx
+          .insert(schema.message)
+          .values({
+            id: newId("message"),
+            organizationId,
+            conversationId: conversation.id,
+            waMessageId: input.waMessageId,
+            direction: "in",
+            type: input.type,
+            text: input.text,
+            status: "delivered",
+            waTimestamp,
+          })
+          .onConflictDoNothing()
+          .returning();
+        const inserted = insertedMessages[0];
+        if (inserted) return inserted;
+
+        const duplicateRows = await tx
+          .select()
+          .from(schema.message)
+          .where(
+            and(
+              eq(schema.message.organizationId, organizationId),
+              eq(schema.message.waMessageId, input.waMessageId)
+            )
+          )
+          .for("update")
+          .limit(1);
+        const duplicate = duplicateRows[0];
+        if (!duplicate) throw new Error("inbound_message_missing");
+        if (duplicate.conversationId !== conversation.id) {
+          throw new Error("inbound_identity_conflict");
+        }
+        existingMessage = duplicate;
+        return duplicate;
+      },
+
+      async updateConversation() {
+        await tx
+          .update(schema.conversation)
+          .set({
+            lastInboundAt: waTimestamp,
+            lastMessageAt: waTimestamp,
+            unreadCount: sql`${schema.conversation.unreadCount} + 1`,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(schema.conversation.id, conversation.id),
+              eq(schema.conversation.organizationId, organizationId)
+            )
+          );
+      },
+
+      async updateLead() {
+        const existingLeads = await tx
+          .select({ id: schema.lead.id })
+          .from(schema.lead)
+          .where(
+            and(
+              eq(schema.lead.organizationId, organizationId),
+              eq(schema.lead.contactId, contact.id)
+            )
+          )
+          .limit(1);
+        const existingLead = existingLeads[0];
+        if (existingLead) {
+          await tx
+            .update(schema.lead)
+            .set({ lastActivityAt: waTimestamp, updatedAt: now })
+            .where(
+              and(
+                eq(schema.lead.id, existingLead.id),
+                eq(schema.lead.organizationId, organizationId)
+              )
+            );
+          return;
+        }
+
+        const firstStages = await tx
+          .select({ id: schema.pipelineStage.id })
+          .from(schema.pipelineStage)
+          .where(
+            and(
+              eq(schema.pipelineStage.organizationId, organizationId),
+              eq(schema.pipelineStage.kind, "open")
+            )
+          )
+          .orderBy(asc(schema.pipelineStage.position))
+          .limit(1);
+        const firstStage = firstStages[0];
+        if (!firstStage) return;
+
+        const maxPositions = await tx
+          .select({
+            max: sql<number>`coalesce(max(${schema.lead.position}), -1)`,
+          })
+          .from(schema.lead)
+          .where(
+            and(
+              eq(schema.lead.organizationId, organizationId),
+              eq(schema.lead.stageId, firstStage.id)
+            )
+          );
+        await tx
+          .insert(schema.lead)
+          .values({
+            id: newId("lead"),
+            organizationId,
+            contactId: contact.id,
+            stageId: firstStage.id,
+            position: (maxPositions[0]?.max ?? -1) + 1,
+            lastActivityAt: waTimestamp,
+          })
+          .onConflictDoUpdate({
+            target: schema.lead.contactId,
+            set: { lastActivityAt: waTimestamp, updatedAt: now },
+          });
+      },
+
+      async createDispatch(message) {
+        await tx
+          .insert(schema.agentDispatch)
+          .values({
+            id: newId("agentDispatch"),
+            organizationId,
+            conversationId: conversation.id,
+            sourceMessageId: message.id,
+            availableAt: now,
+            createdAt: now,
+            updatedAt: now,
+          })
+          .onConflictDoNothing();
+      },
+
+      async markProcessed(message) {
+        const processed = await tx
+          .update(schema.message)
+          .set({ processedAt: now })
+          .where(
+            and(
+              eq(schema.message.id, message.id),
+              eq(schema.message.organizationId, organizationId),
+              isNull(schema.message.processedAt)
+            )
+          )
+          .returning();
+        const updated = processed[0];
+        if (!updated) throw new Error("inbound_processed_race");
+        return updated;
+      },
+    });
+
+    return { ...effects, contact, conversation };
+  });
+
+  if (!result.applied) return;
+  publishAfterCommit(organizationId, {
     type: "message.new",
-    data: { conversationId: conversation.id, message: serializeMessage(message) },
+    data: {
+      conversationId: result.conversation.id,
+      message: serializeMessage(result.message),
+    },
   });
-  publish(organizationId, {
+  publishAfterCommit(organizationId, {
     type: "conversation.updated",
-    data: { conversation: { id: conversation.id } },
+    data: { conversation: { id: result.conversation.id } },
   });
 
-  await maybeRunAgentTurn(conversation.id);
+  try {
+    scheduleAgentDispatch(result.conversation.id);
+  } catch {
+    console.error("[inbound] agent_wakeup_failed");
+  }
+}
+
+function publishAfterCommit(
+  organizationId: string,
+  event: Parameters<typeof publish>[1]
+): void {
+  try {
+    publish(organizationId, event);
+  } catch {
+    console.error("[inbound] sse_publish_failed");
+  }
 }
 
 function toDate(timestamp: string): Date {
-  const n = Number(timestamp);
-  if (Number.isFinite(n) && n > 0) return new Date(n * 1000);
+  const value = Number(timestamp);
+  if (Number.isFinite(value) && value > 0) return new Date(value * 1000);
   return new Date();
 }
 
-export function serializeMessage(m: typeof schema.message.$inferSelect) {
+export function serializeMessage(message: typeof schema.message.$inferSelect) {
   return {
-    id: m.id,
-    conversationId: m.conversationId,
-    direction: m.direction,
-    type: m.type,
-    text: m.text,
-    status: m.status,
-    aiGenerated: m.aiGenerated,
-    createdAt: (m.waTimestamp ?? m.createdAt).toISOString(),
+    id: message.id,
+    conversationId: message.conversationId,
+    direction: message.direction,
+    type: message.type,
+    text: message.text,
+    status:
+      message.deliveryState === "failed" && message.status === "pending"
+        ? "failed"
+        : message.status,
+    aiGenerated: message.aiGenerated,
+    createdAt: (message.waTimestamp ?? message.createdAt).toISOString(),
   };
 }

@@ -14,6 +14,11 @@ export type SseEvent =
     }
   | { type: "conversation.updated"; data: { conversation: unknown } }
   | {
+      type: "channel.sync";
+      data: { progress: number | null; inserted: number };
+    }
+  | { type: "presence"; data: { phone: string; composing: boolean } }
+  | {
       type: "lab.run";
       data: {
         runId: string;

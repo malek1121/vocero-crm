@@ -4,8 +4,11 @@ import { apiError, parseBody, withAuth } from "@/lib/api";
 import { getDb, schema } from "@/lib/db";
 import { newId } from "@/lib/db/ids";
 import { scoped } from "@/lib/db/tenant";
+import { renderKb } from "@/server/ai/prompts";
 
 export const dynamic = "force-dynamic";
+
+const KB_WARNING_CHARS = 24_000;
 
 export const GET = withAuth(async (session) => {
   const db = getDb();
@@ -14,21 +17,28 @@ export const GET = withAuth(async (session) => {
     .from(schema.kbEntry)
     .where(scoped(schema.kbEntry.organizationId, session.organizationId))
     .orderBy(asc(schema.kbEntry.createdAt));
-  return Response.json({ entries });
+  const chars = renderKb(entries).length;
+  return Response.json({
+    entries,
+    size: {
+      chars,
+      warnAt: KB_WARNING_CHARS,
+      warning: chars >= KB_WARNING_CHARS,
+    },
+  });
 });
 
-const createSchema = z
-  .discriminatedUnion("kind", [
-    z.object({
-      kind: z.literal("qa"),
-      question: z.string().trim().min(1).max(500),
-      answer: z.string().trim().min(1).max(4000),
-    }),
-    z.object({
-      kind: z.literal("block"),
-      content: z.string().trim().min(1).max(8000),
-    }),
-  ]);
+const createSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("qa"),
+    question: z.string().trim().min(1).max(500),
+    answer: z.string().trim().min(1).max(4000),
+  }),
+  z.object({
+    kind: z.literal("block"),
+    content: z.string().trim().min(1).max(8000),
+  }),
+]);
 
 export const POST = withAuth(async (session, req: Request) => {
   const body = await parseBody(req, createSchema);

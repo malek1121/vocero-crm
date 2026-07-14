@@ -1,3 +1,8 @@
+> **⚠️ PARCIALMENTE SUPERSEDIDA (2026-07-13)**: el canal WhatsApp y el proveedor
+> LLM descritos aquí fueron reemplazados — ver [specs/002-baileys-channel](../002-baileys-channel/spec.md)
+> (canal por QR vía Baileys) y constitución v2.0.0 (IA vía Cloudflare Workers AI,
+> vars `AI_*`). Este documento se conserva como registro histórico del v1.
+
 # Feature Specification: Vocero CRM — Núcleo v1 (001-vocero-core)
 
 **Feature Branch**: `001-vocero-core`

@@ -18,8 +18,9 @@
 1. Pregunta al usuario ÚNICAMENTE estas tres cosas, en un solo mensaje:
    - **Dominio** donde vivirá el CRM (obligatorio, ej. `crm.sunegocio.com`).
      Debe apuntar ya a la IP del VPS (registro A).
-   - **Token de OpenRouter** (opcional — sin él, el CRM funciona completo
-     excepto el agente de IA y el Laboratorio; se puede agregar después).
+   - **Credenciales de Cloudflare Workers AI** (opcionales — Account ID + API
+     token con permiso "Workers AI"; sin ellas, el CRM funciona completo
+     excepto el agente de IA y el Laboratorio; se pueden agregar después).
    - **Ruta A o B**: A = el VPS tiene panel Coolify · B = el VPS solo tiene
      Docker.
 2. **Genera tú mismo todos los secretos** (no se los pidas):
@@ -27,12 +28,11 @@
    ```bash
    openssl rand -base64 32   # BETTER_AUTH_SECRET
    openssl rand -base64 32   # ENCRYPTION_KEY (exactamente 32 bytes base64)
-   openssl rand -hex 32      # META_WEBHOOK_VERIFY_TOKEN
    openssl rand -hex 24      # POSTGRES_PASSWORD
    ```
 
 3. La conexión de WhatsApp NO es parte del despliegue: al terminar, dile al
-   usuario que se hace desde la app.
+   usuario que se hace desde la app escaneando un código QR.
 
 ## Variables de entorno (ambas rutas)
 
@@ -43,10 +43,9 @@
 | `POSTGRES_PASSWORD` | generado |
 | `BETTER_AUTH_SECRET` | generado |
 | `ENCRYPTION_KEY` | generado (base64, 44 caracteres) |
-| `META_WEBHOOK_VERIFY_TOKEN` | generado |
-| `META_GRAPH_API_VERSION` | `v25.0` |
-| `OPENROUTER_API_TOKEN` | del usuario (si lo dio) |
-| `OPENROUTER_MODEL` | si hay token: sugiere `anthropic/claude-sonnet-4.5` u otro a elección |
+| `AI_BASE_URL` | si hay credenciales: `https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai` |
+| `AI_API_TOKEN` | del usuario (si lo dio) |
+| `AI_MODEL` | si hay token: sugiere `@cf/meta/llama-3.3-70b-instruct-fp8-fast` u otro a elección |
 
 `DOMAIN` solo aplica en la Ruta B (para Caddy).
 
@@ -89,10 +88,11 @@ docker compose up -d --build
 >    el registro público se cierra solo).
 > 2. Pulsa **"Cargar datos de demostración"** si quieres explorar con la
 >    Ferretería El Martillo.
-> 3. Para conectar tu WhatsApp entra a **Configuración → WhatsApp**: ahí está
->    el wizard y la URL exacta del webhook para el panel de Meta o para tu
->    backend de agencia. La conexión del número NO es parte de esta
->    instalación.
+> 3. Para conectar tu WhatsApp entra a **Configuración → WhatsApp**, pulsa
+>    **Conectar** y escanea el código QR desde el teléfono (WhatsApp →
+>    Dispositivos vinculados). Usa un número dedicado: el canal es un cliente
+>    no oficial (Baileys) y el número puede ser baneado. La conexión NO es
+>    parte de esta instalación.
 
 ## Diagnóstico rápido
 
@@ -100,4 +100,3 @@ docker compose up -d --build
   variable faltante (la validación de entorno lista cuál) o la BD inaccesible.
 - `ENCRYPTION_KEY` inválida → debe ser EXACTAMENTE 32 bytes en base64
   (44 caracteres): regénérala con `openssl rand -base64 32`.
-- Webhook "no verificado" en Meta → el dominio aún no resuelve o no es https.

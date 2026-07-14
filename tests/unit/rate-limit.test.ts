@@ -1,43 +1,43 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { AUTH_RATE_LIMIT, checkRateLimit, resetRateLimit } from "@/lib/rate-limit";
+import {
+  AUTH_RATE_LIMIT,
+  RATE_LIMIT_MAX_KEYS,
+  checkRateLimit,
+  rateLimitStoreSize,
+  resetRateLimit,
+} from "@/lib/rate-limit";
 
-describe("rate limit por IP (FR-062: 10 / 10 min → 429)", () => {
+describe("in-process rate limit", () => {
   beforeEach(() => resetRateLimit());
 
-  it("permite hasta el máximo y bloquea el siguiente", () => {
+  it("allows up to the maximum and blocks the next attempt", () => {
     const t0 = 1_000_000;
     for (let i = 0; i < AUTH_RATE_LIMIT.max; i++) {
-      expect(
-        checkRateLimit("login:1.2.3.4", AUTH_RATE_LIMIT, t0 + i).allowed
-      ).toBe(true);
+      expect(checkRateLimit("login:1.2.3.4", AUTH_RATE_LIMIT, t0 + i).allowed).toBe(true);
     }
-    expect(
-      checkRateLimit("login:1.2.3.4", AUTH_RATE_LIMIT, t0 + 100).allowed
-    ).toBe(false);
+    expect(checkRateLimit("login:1.2.3.4", AUTH_RATE_LIMIT, t0 + 100).allowed).toBe(false);
   });
 
-  it("la ventana desliza: pasados 10 minutos vuelve a permitir", () => {
+  it("slides the window and prunes expired keys", () => {
     const t0 = 1_000_000;
-    for (let i = 0; i < AUTH_RATE_LIMIT.max; i++) {
-      checkRateLimit("k", AUTH_RATE_LIMIT, t0 + i);
+    for (let i = 0; i < 300; i++) {
+      checkRateLimit(`expired:${i}`, AUTH_RATE_LIMIT, t0);
     }
-    expect(checkRateLimit("k", AUTH_RATE_LIMIT, t0 + 1000).allowed).toBe(false);
-    expect(
-      checkRateLimit("k", AUTH_RATE_LIMIT, t0 + AUTH_RATE_LIMIT.windowMs + 500)
-        .allowed
-    ).toBe(true);
+    checkRateLimit("fresh", AUTH_RATE_LIMIT, t0 + AUTH_RATE_LIMIT.windowMs + 1);
+    expect(rateLimitStoreSize()).toBe(1);
   });
 
-  it("claves distintas (IPs) no se afectan entre sí", () => {
-    const t0 = 1_000_000;
-    for (let i = 0; i < AUTH_RATE_LIMIT.max; i++) {
-      checkRateLimit("login:1.1.1.1", AUTH_RATE_LIMIT, t0 + i);
+  it("caps unique keys under an address flood", () => {
+    for (let i = 0; i < RATE_LIMIT_MAX_KEYS + 50; i++) {
+      checkRateLimit(`ip:${i}`, AUTH_RATE_LIMIT, 2_000_000 + i);
     }
-    expect(
-      checkRateLimit("login:1.1.1.1", AUTH_RATE_LIMIT, t0 + 100).allowed
-    ).toBe(false);
-    expect(
-      checkRateLimit("login:2.2.2.2", AUTH_RATE_LIMIT, t0 + 100).allowed
-    ).toBe(true);
+    expect(rateLimitStoreSize()).toBeLessThanOrEqual(RATE_LIMIT_MAX_KEYS);
+  });
+
+  it("isolates keys", () => {
+    const t0 = 1_000_000;
+    for (let i = 0; i < AUTH_RATE_LIMIT.max; i++) checkRateLimit("a", AUTH_RATE_LIMIT, t0 + i);
+    expect(checkRateLimit("a", AUTH_RATE_LIMIT, t0 + 100).allowed).toBe(false);
+    expect(checkRateLimit("b", AUTH_RATE_LIMIT, t0 + 100).allowed).toBe(true);
   });
 });

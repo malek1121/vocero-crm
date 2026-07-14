@@ -10,6 +10,8 @@ export type EventHandlers = {
     status: string;
   }) => void;
   onConversationUpdated?: (data: { conversation: unknown }) => void;
+  onChannelSync?: (data: { progress: number | null; inserted: number }) => void;
+  onPresence?: (data: { phone: string; composing: boolean }) => void;
   onLabRun?: (data: {
     runId: string;
     status: string;
@@ -50,6 +52,10 @@ export function useEvents(handlers: EventHandlers): void {
     listen("conversation.updated", (d) =>
       handlersRef.current.onConversationUpdated?.(d as never)
     );
+    listen("channel.sync", (d) =>
+      handlersRef.current.onChannelSync?.(d as never)
+    );
+    listen("presence", (d) => handlersRef.current.onPresence?.(d as never));
     listen("lab.run", (d) => handlersRef.current.onLabRun?.(d as never));
 
     source.onerror = () => {

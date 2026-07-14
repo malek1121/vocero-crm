@@ -5,6 +5,7 @@ import Link from "next/link";
 import { Check, ChevronRight, Sparkles, UserRound } from "lucide-react";
 import type { ConversationDto, StageDto } from "@/lib/types";
 import { cn, formatPhone } from "@/lib/utils";
+import { apiRequest } from "@/lib/client-api";
 import { ContactAvatar } from "@/components/avatar";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
@@ -28,7 +29,7 @@ export function ContactPanel({
   onPatchConversation: (patch: {
     aiEnabled?: boolean;
     reactivate?: boolean;
-  }) => Promise<void>;
+  }) => Promise<boolean>;
   onClose: () => void;
 }) {
   const [notes, setNotes] = useState("");
@@ -41,6 +42,7 @@ export function ContactPanel({
   // cuando el agente aún no se ha configurado/encendido.
   const [agentEnabled, setAgentEnabled] = useState(false);
   const [aiConfigured, setAiConfigured] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const contactId = conversation.contact.id;
 
@@ -95,23 +97,44 @@ export function ContactPanel({
 
   async function moveToStage(stageId: string) {
     if (!leadId || stageId === currentStageId) return;
-    setCurrentStageId(stageId); // optimista
-    await fetch(`/api/pipeline/leads/${leadId}`, {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ stageId, position: 0 }),
-    }).catch(() => null);
-    void refreshLive();
+    const previousStageId = currentStageId;
+    setCurrentStageId(stageId);
+    setError(null);
+    try {
+      await apiRequest(
+        `/api/pipeline/leads/${leadId}`,
+        {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ stageId, position: 0 }),
+        },
+        "No se pudo mover el contacto"
+      );
+      await refreshLive();
+    } catch (requestError) {
+      setCurrentStageId(previousStageId);
+      setError(requestError instanceof Error ? requestError.message : "No se pudo mover el contacto");
+    }
   }
 
   async function saveNotes() {
     setSavingNotes(true);
-    await fetch(`/api/contacts/${contactId}`, {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ notes }),
-    }).catch(() => null);
-    setSavingNotes(false);
+    setError(null);
+    try {
+      await apiRequest(
+        `/api/contacts/${contactId}`,
+        {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ notes }),
+        },
+        "No se pudieron guardar las notas"
+      );
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "No se pudieron guardar las notas");
+    } finally {
+      setSavingNotes(false);
+    }
   }
 
   const currentIndex = stages.findIndex((s) => s.id === currentStageId);
@@ -131,6 +154,7 @@ export function ContactPanel({
         </button>
       </header>
 
+      {error && <p className="border-b px-4 py-2 text-sm text-destructive" role="alert">{error}</p>}
       <div className="flex-1 overflow-y-auto">
         {/* Contacto */}
         <section className="border-b p-4">
@@ -220,7 +244,7 @@ export function ContactPanel({
                 <p className="text-[11px] leading-relaxed text-[#8a6d3b]">
                   {aiConfigured
                     ? "La IA todavía no responde por su cuenta. Configura lo básico del agente y enciéndelo."
-                    : "Falta la clave de IA de la instancia (OPENROUTER_API_TOKEN) para que el agente pueda responder."}
+                    : "Falta la clave de IA de la instancia (AI_API_TOKEN) para que el agente pueda responder."}
                   {aiConfigured && (
                     <Link
                       href="/agent"
@@ -285,10 +309,11 @@ export function ContactPanel({
 
         {/* Notas */}
         <section className="p-4">
-          <p className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-text-3">
+          <label htmlFor="contact-notes" className="mb-2 block text-[11px] font-semibold uppercase tracking-wide text-text-3">
             Notas
-          </p>
+          </label>
           <Textarea
+            id="contact-notes"
             rows={5}
             placeholder="Notas internas sobre este contacto…"
             value={notes}

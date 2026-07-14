@@ -1,88 +1,23 @@
-import { asc, desc, eq } from "drizzle-orm";
+import { and, asc, desc, eq } from "drizzle-orm";
 import { getDb, schema } from "@/lib/db";
 import { newId } from "@/lib/db/ids";
-import { getEnv, isAiConfigured } from "@/lib/env";
-import { chatJson, type ChatMessage } from "@/lib/ai";
+import { isAiConfigured } from "@/lib/env";
+import { chatJson, throwIfAborted, type ChatMessage } from "@/lib/ai";
 import { publish } from "@/server/events/bus";
-import { isWindowOpen } from "@/server/inbox/window";
 import { SendError, sendText } from "@/server/inbox/send";
 import { AgentAction, degradeAction, resolveStage, type AgentActionType } from "@/server/ai/actions";
 import { matchesHandoffIntent } from "@/server/ai/handoff";
 import { buildAgentSystemPrompt } from "@/server/ai/prompts";
 
 /**
- * Turno del agente (FR-021..FR-025).
- *
- * Coalesce + lock in-process por conversación: ráfagas de mensajes → UNA
- * respuesta; nunca dos turnos simultáneos; lo que llega durante un turno
- * re-encola exactamente un turno más. Suficiente para el monolito de una
- * instancia (sin colas externas — Constitución II).
- */
-
-type CoalesceEntry = {
-  timer: ReturnType<typeof setTimeout> | null;
-  running: boolean;
-  pending: boolean;
-};
-
-const globalForAgent = globalThis as unknown as {
-  __agentCoalesce?: Map<string, CoalesceEntry>;
-};
-
-function coalesceMap(): Map<string, CoalesceEntry> {
-  if (!globalForAgent.__agentCoalesce) {
-    globalForAgent.__agentCoalesce = new Map();
-  }
-  return globalForAgent.__agentCoalesce;
-}
-
-/** Punto de entrada con debounce (mensajes entrantes reales). */
-export function scheduleAgentTurn(conversationId: string): void {
-  const map = coalesceMap();
-  const entry = map.get(conversationId) ?? {
-    timer: null,
-    running: false,
-    pending: false,
-  };
-  map.set(conversationId, entry);
-
-  if (entry.running) {
-    entry.pending = true; // se re-encola al terminar el turno actual
-    return;
-  }
-  if (entry.timer) clearTimeout(entry.timer);
-  const delay = getEnv().AGENT_COALESCE_MS;
-  entry.timer = setTimeout(() => {
-    entry.timer = null;
-    void executeTurn(conversationId);
-  }, delay);
-}
-
-async function executeTurn(conversationId: string): Promise<void> {
-  const map = coalesceMap();
-  const entry = map.get(conversationId);
-  if (!entry || entry.running) return;
-  entry.running = true;
-  try {
-    await runAgentTurn(conversationId);
-  } catch (err) {
-    console.error("[agente] turno falló:", err);
-  } finally {
-    entry.running = false;
-    if (entry.pending) {
-      entry.pending = false;
-      void executeTurn(conversationId);
-    } else {
-      map.delete(conversationId);
-    }
-  }
-}
-
-/**
  * Ejecuta UN turno del agente ahora (el Laboratorio lo llama directo, con
  * debounce 0 y sin pasar por el coalesce).
  */
-export async function runAgentTurn(conversationId: string): Promise<void> {
+export async function runAgentTurn(
+  conversationId: string,
+  options: { replyIdempotencyKey?: string; signal?: AbortSignal } = {}
+): Promise<void> {
+  throwIfAborted(options.signal);
   if (!isAiConfigured()) return;
 
   const db = getDb();
@@ -118,12 +53,10 @@ export async function runAgentTurn(conversationId: string): Promise<void> {
   history.reverse();
   const lastInbound = [...history].reverse().find((m) => m.direction === "in");
   if (!lastInbound) return;
+  const replyIdempotencyKey =
+    options.replyIdempotencyKey ?? "agent:" + lastInbound.id;
 
-  // Ventana cerrada: el agente JAMÁS envía texto libre → handoff 'ventana'.
-  if (!conversation.isTest && !isWindowOpen(conversation.lastInboundAt)) {
-    await applyHandoff(conversationId, organizationId, "ventana");
-    return;
-  }
+  // Baileys no tiene ventana de 24h (spec 002 FR-B06): sin handoff 'ventana'.
 
   // Patrón de respaldo ANTES del LLM (FR-022).
   if (lastInbound.text && matchesHandoffIntent(lastInbound.text)) {
@@ -155,11 +88,15 @@ export async function runAgentTurn(conversationId: string): Promise<void> {
       })),
   ];
 
-  const result = await chatJson(AgentAction, messages);
+  throwIfAborted(options.signal);
+  const result = await chatJson(AgentAction, messages, {
+    signal: options.signal,
+  });
+  throwIfAborted(options.signal);
   if (!result.ok) {
     if (result.error === "not_configured") return;
     // Fallo persistente del proveedor o salida imposible → escalar (FR-022).
-    console.error(`[agente] fallo del proveedor (raw): ${result.detail}`);
+    console.error(`[agent] provider_failed code=${result.error}`);
     await applyHandoff(conversationId, organizationId, "error");
     return;
   }
@@ -177,7 +114,7 @@ export async function runAgentTurn(conversationId: string): Promise<void> {
         data: { conversation: { id: conversationId } },
       });
       if (action.reply) {
-        await deliverReply(conversation, action.reply);
+        await deliverReply(conversation, action.reply, replyIdempotencyKey);
       }
       return;
     }
@@ -187,16 +124,16 @@ export async function runAgentTurn(conversationId: string): Promise<void> {
     case "none":
       return;
     case "reply":
-      await deliverReply(conversation, action.text);
+      await deliverReply(conversation, action.text, replyIdempotencyKey);
       return;
     case "update_lead": {
       await appendLeadNote(organizationId, conversation.contactId, action.note);
-      if (action.reply) await deliverReply(conversation, action.reply);
+      if (action.reply) await deliverReply(conversation, action.reply, replyIdempotencyKey);
       return;
     }
     case "handoff": {
       if (action.farewell) {
-        await deliverReply(conversation, action.farewell);
+        await deliverReply(conversation, action.farewell, replyIdempotencyKey);
       }
       await applyHandoff(conversationId, organizationId, "modelo");
       return;
@@ -209,26 +146,48 @@ type Conversation = typeof schema.conversation.$inferSelect;
 /** Entrega la respuesta: envío real o persistencia sandbox (is_test). */
 async function deliverReply(
   conversation: Conversation,
-  text: string
+  text: string,
+  idempotencyKey: string
 ): Promise<void> {
   if (conversation.isTest) {
     await persistTestOutbound(conversation, text);
     return;
   }
+  // "Escribiendo…" hacia el contacto mientras se entrega (spec 004 FR-412).
+  const phone = await contactPhone(conversation);
+  const { sendChannelTyping } = await import("@/server/baileys/manager");
+  if (phone) await sendChannelTyping(conversation.organizationId, phone, "composing");
   try {
     await sendText({
       conversationId: conversation.id,
       organizationId: conversation.organizationId,
       text,
       aiGenerated: true,
+      idempotencyKey,
     });
-  } catch (err) {
-    if (err instanceof SendError && err.code === "window_closed") {
-      await applyHandoff(conversation.id, conversation.organizationId, "ventana");
-      return;
-    }
-    throw err;
+  } catch (error) {
+    // The dispatcher owns the decision, not provider delivery. A durable intent
+    // is enough to complete the dispatch; channel recovery owns later retries.
+    if (error instanceof SendError && error.intent) return;
+    throw error;
+  } finally {
+    if (phone) await sendChannelTyping(conversation.organizationId, phone, "paused");
   }
+}
+
+async function contactPhone(conversation: Conversation): Promise<string | null> {
+  const db = getDb();
+  const rows = await db
+    .select({ phone: schema.contact.phone })
+    .from(schema.contact)
+    .where(
+      and(
+        eq(schema.contact.id, conversation.contactId),
+        eq(schema.contact.organizationId, conversation.organizationId)
+      )
+    )
+    .limit(1);
+  return rows[0]?.phone ?? null;
 }
 
 /** Mensaje saliente del sandbox: se persiste, JAMÁS toca la API (FR-031). */
