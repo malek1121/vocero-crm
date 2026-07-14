@@ -27,7 +27,6 @@ export type MessageAddress = {
 
 /** Resuelve el teléfono de un chat directo, incluido LID con JID alternativo. */
 export function resolveMessagePhone(key: MessageAddress): string | null {
-  if (key.fromMe) return null;
   const direct = jidToPhone(key.remoteJid);
   if (direct) return direct;
   if (!key.remoteJid?.endsWith("@lid")) return null;

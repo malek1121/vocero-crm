@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+﻿import { describe, expect, it } from "vitest";
 import {
   ackToStatus,
   extractContent,
@@ -9,17 +9,17 @@ import {
 } from "@/server/baileys/map";
 
 describe("toJid / jidToPhone", () => {
-  it("teléfono → jid de usuario", () => {
+  it("telÃ©fono â†’ jid de usuario", () => {
     expect(toJid("5215512345678")).toBe("5215512345678@s.whatsapp.net");
     expect(toJid("+52 55 1234 5678")).toBe("525512345678@s.whatsapp.net");
   });
 
-  it("jid directo → teléfono (con y sin device suffix)", () => {
+  it("jid directo â†’ telÃ©fono (con y sin device suffix)", () => {
     expect(jidToPhone("5215512345678@s.whatsapp.net")).toBe("5215512345678");
     expect(jidToPhone("5215512345678:12@s.whatsapp.net")).toBe("5215512345678");
   });
 
-  it("grupos, broadcast y desconocidos → null", () => {
+  it("grupos, broadcast y desconocidos â†’ null", () => {
     expect(jidToPhone("123456-987654@g.us")).toBeNull();
     expect(jidToPhone("status@broadcast")).toBeNull();
     expect(jidToPhone(null)).toBeNull();
@@ -48,7 +48,7 @@ describe("resolveMessagePhone", () => {
     ).toBe("5215512345678");
   });
 
-  it("rejects self, group, broadcast, and invalid alternate traffic", () => {
+  it("resolves companion-originated messages and rejects non-direct traffic", () => {
     const alternate = "5215512345678@s.whatsapp.net";
     expect(
       resolveMessagePhone({
@@ -56,7 +56,7 @@ describe("resolveMessagePhone", () => {
         remoteJidAlt: alternate,
         fromMe: true,
       })
-    ).toBeNull();
+    ).toBe("5215512345678");
     expect(
       resolveMessagePhone({
         remoteJid: "123456-987654@g.us",
@@ -81,7 +81,7 @@ describe("resolveMessagePhone", () => {
   });
 });
 describe("extractHistoryMessage", () => {
-  it("entrante histórico → dirección in con teléfono canónico", () => {
+  it("entrante histÃ³rico â†’ direcciÃ³n in con telÃ©fono canÃ³nico", () => {
     expect(
       extractHistoryMessage({
         key: { remoteJid: "5215512345678@s.whatsapp.net", id: "AAA", fromMe: false },
@@ -98,7 +98,7 @@ describe("extractHistoryMessage", () => {
     });
   });
 
-  it("saliente histórico (fromMe) → dirección out", () => {
+  it("saliente histÃ³rico (fromMe) â†’ direcciÃ³n out", () => {
     const r = extractHistoryMessage({
       key: { remoteJid: "5215512345678@s.whatsapp.net", id: "BBB", fromMe: true },
       message: { conversation: "respuesta" },
@@ -120,7 +120,7 @@ describe("extractHistoryMessage", () => {
         map
       )?.phone
     ).toBe("5215512345678");
-    // Sin mapa (o LID desconocido) → null.
+    // Sin mapa (o LID desconocido) â†’ null.
     expect(
       extractHistoryMessage({
         key: { remoteJid: "999@lid", id: "FFF", fromMe: false },
@@ -130,7 +130,7 @@ describe("extractHistoryMessage", () => {
     ).toBeNull();
   });
 
-  it("LID con jid alternativo se resuelve; grupos/sin-id → null", () => {
+  it("LID con jid alternativo se resuelve; grupos/sin-id â†’ null", () => {
     expect(
       extractHistoryMessage({
         key: {
@@ -167,7 +167,7 @@ describe("ackToStatus", () => {
     expect(ackToStatus(4)).toBe("read");
   });
 
-  it("otros acks → null (los ignora)", () => {
+  it("otros acks â†’ null (los ignora)", () => {
     expect(ackToStatus(0)).toBeNull();
     expect(ackToStatus(1)).toBeNull();
     expect(ackToStatus(5)).toBeNull();
@@ -199,9 +199,9 @@ describe("extractContent", () => {
     });
   });
 
-  it("sin contenido soportado → null", () => {
+  it("sin contenido soportado â†’ null", () => {
     expect(extractContent(null)).toBeNull();
     expect(extractContent({})).toBeNull();
-    expect(extractContent({ reactionMessage: { text: "👍" } })).toBeNull();
+    expect(extractContent({ reactionMessage: { text: "ðŸ‘" } })).toBeNull();
   });
 });

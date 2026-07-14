@@ -81,7 +81,7 @@ export function MessageThread({
             ) : (
               <ChevronUp className="h-3.5 w-3.5" aria-hidden="true" />
             )}
-            {loadingOlder ? "Cargando?" : "Ver mensajes anteriores"}
+            {loadingOlder ? "Cargando..." : "Ver mensajes anteriores"}
           </button>
         </div>
       )}

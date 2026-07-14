@@ -2,6 +2,82 @@ import { and, eq, sql } from "drizzle-orm";
 import { getDb, schema } from "@/lib/db";
 import { newId } from "@/lib/db/ids";
 import { jidToPhone, type HistoryMessage } from "@/server/baileys/map";
+export type { HistoryMessage } from "@/server/baileys/map";
+import { publish } from "@/server/events/bus";
+import { serializeMessage } from "@/server/inbox/ingest";
+
+export const HISTORY_CHAT_LIMIT = 30;
+export const HISTORY_MESSAGES_PER_CHAT = 100;
+
+type BufferedChat = {
+  latestTimestamp: number;
+  messages: Map<string, HistoryMessage>;
+};
+
+export type HistoryBuffer = Map<string, BufferedChat>;
+
+export function newHistoryBuffer(): HistoryBuffer {
+  return new Map();
+}
+
+function historyTimestamp(item: HistoryMessage): number {
+  const value = Number(item.timestamp);
+  return Number.isFinite(value) ? value : 0;
+}
+
+/**
+ * Keeps a bounded, newest-first candidate set until history sync completes.
+ * No database rows are created while the candidate set is incomplete.
+ */
+export function addHistoryMessages(
+  buffer: HistoryBuffer,
+  items: HistoryMessage[],
+  chatLimit = HISTORY_CHAT_LIMIT,
+  messageLimit = HISTORY_MESSAGES_PER_CHAT
+): void {
+  const byPhone = new Map<string, HistoryMessage[]>();
+  for (const item of items) {
+    const current = byPhone.get(item.phone) ?? [];
+    current.push(item);
+    byPhone.set(item.phone, current);
+  }
+
+  for (const [phone, phoneItems] of byPhone) {
+    const latestTimestamp = Math.max(...phoneItems.map(historyTimestamp));
+    let chat = buffer.get(phone);
+
+    if (!chat && buffer.size >= chatLimit) {
+      let oldestPhone: string | null = null;
+      let oldestTimestamp = Number.POSITIVE_INFINITY;
+      for (const [candidatePhone, candidate] of buffer) {
+        if (candidate.latestTimestamp < oldestTimestamp) {
+          oldestPhone = candidatePhone;
+          oldestTimestamp = candidate.latestTimestamp;
+        }
+      }
+      if (latestTimestamp <= oldestTimestamp || !oldestPhone) continue;
+      buffer.delete(oldestPhone);
+    }
+
+    chat ??= { latestTimestamp, messages: new Map() };
+    chat.latestTimestamp = Math.max(chat.latestTimestamp, latestTimestamp);
+    for (const item of phoneItems) {
+      chat.messages.set(item.waMessageId, item);
+    }
+
+    const newest = [...chat.messages.values()]
+      .sort((a, b) => historyTimestamp(b) - historyTimestamp(a))
+      .slice(0, messageLimit);
+    chat.messages = new Map(newest.map((item) => [item.waMessageId, item]));
+    buffer.set(phone, chat);
+  }
+}
+
+export function readHistoryMessages(buffer: HistoryBuffer): HistoryMessage[] {
+  return [...buffer.values()]
+    .flatMap((chat) => [...chat.messages.values()])
+    .sort((a, b) => historyTimestamp(a) - historyTimestamp(b));
+}
 
 /**
  * Ingesta de historial (spec 004 FR-401). A diferencia del entrante en vivo:
@@ -279,4 +355,45 @@ export async function ingestHistoryBatch(
   }
 
   return inserted;
+}
+
+
+/**
+ * Mirrors an outgoing message observed from the phone or another companion.
+ * It is durable and idempotent, but never changes unread state or wakes AI.
+ */
+export async function ingestObservedOutgoingMessage(
+  organizationId: string,
+  item: HistoryMessage
+): Promise<boolean> {
+  if (item.direction !== "out") return false;
+  const inserted = await ingestHistoryBatch(organizationId, [item]);
+  if (inserted === 0) return false;
+
+  const db = getDb();
+  const rows = await db
+    .select()
+    .from(schema.message)
+    .where(
+      and(
+        eq(schema.message.organizationId, organizationId),
+        eq(schema.message.waMessageId, item.waMessageId)
+      )
+    )
+    .limit(1);
+  const message = rows[0];
+  if (!message) return false;
+
+  publish(organizationId, {
+    type: "message.new",
+    data: {
+      conversationId: message.conversationId,
+      message: serializeMessage(message),
+    },
+  });
+  publish(organizationId, {
+    type: "conversation.updated",
+    data: { conversation: { id: message.conversationId } },
+  });
+  return true;
 }
