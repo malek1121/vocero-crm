@@ -5,6 +5,8 @@ import { useSearchParams } from "next/navigation";
 import { Archive, ArchiveRestore, Loader2, PanelRight } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { ContactAvatar } from "@/components/avatar";
+import { WhatsappQr } from "@/components/settings/whatsapp-qr";
+import { isWhatsappInboxAvailable } from "@/components/settings/whatsapp-state";
 import type { ConversationDto, MessageDto } from "@/lib/types";
 import { apiRequest } from "@/lib/client-api";
 import { useEvents } from "@/components/use-events";
@@ -12,6 +14,12 @@ import { ConversationList } from "./conversation-list";
 import { MessageThread } from "./message-thread";
 import { Composer } from "./composer";
 import { ContactPanel } from "./contact-panel";
+
+type WhatsappInboxState = {
+  status: "unlinked" | "connecting" | "qr" | "connected" | "reconnecting";
+  initialImportComplete: boolean;
+  syncProgress: number | null;
+};
 
 export function InboxClient() {
   const [conversations, setConversations] = useState<ConversationDto[] | null>(
@@ -30,25 +38,47 @@ export function InboxClient() {
   const [detailRev, setDetailRev] = useState(0);
   // Progreso de sync de historial al vincular (spec 004 FR-402); null = sin sync.
   const [syncProgress, setSyncProgress] = useState<number | null>(null);
+  const [channelState, setChannelState] = useState<WhatsappInboxState | null>(null);
+  const [remoteHistoryPending, setRemoteHistoryPending] = useState(false);
+  const [remoteHistoryExhausted, setRemoteHistoryExhausted] = useState(false);
   // Filtro Activas/Archivadas (spec 004 FR-421).
   const [showArchived, setShowArchived] = useState(false);
   // Teléfono del contacto que está "escribiendo…" (spec 004 FR-412).
   const [typingPhone, setTypingPhone] = useState<string | null>(null);
   const typingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  useEffect(() => {
-    // Semilla: si el sync ya arrancó cuando se abre la Bandeja.
-    fetch("/api/settings/whatsapp", { cache: "no-store" })
-      .then((r) => (r.ok ? r.json() : null))
-      .then((d: { syncProgress?: number | null } | null) => {
-        if (d && typeof d.syncProgress === "number") setSyncProgress(d.syncProgress);
-      })
-      .catch(() => {});
+  const refetchChannelState = useCallback(async () => {
+    try {
+      const response = await fetch("/api/settings/whatsapp", {
+        cache: "no-store",
+      });
+      if (!response.ok) return;
+      const state = (await response.json()) as WhatsappInboxState;
+      setChannelState(state);
+      setSyncProgress(state.syncProgress);
+    } catch {
+      // The next poll retries without hiding an already loaded inbox.
+    }
   }, []);
+
+  useEffect(() => {
+    void refetchChannelState();
+    const id = setInterval(() => void refetchChannelState(), 2000);
+    return () => clearInterval(id);
+  }, [refetchChannelState]);
 
   useEffect(() => {
     setPanelOpen(localStorage.getItem("vocero.panelOpen") !== "false");
   }, []);
+
+  useEffect(() => {
+    if (!remoteHistoryPending) return;
+    const id = setTimeout(() => {
+      setRemoteHistoryPending(false);
+      setError("WhatsApp no respondio con mas mensajes. Puedes intentarlo otra vez.");
+    }, 30000);
+    return () => clearTimeout(id);
+  }, [remoteHistoryPending]);
   const togglePanel = useCallback((open: boolean) => {
     setPanelOpen(open);
     localStorage.setItem("vocero.panelOpen", String(open));
@@ -117,38 +147,84 @@ export function InboxClient() {
 
   const loadOlderMessages = useCallback(async () => {
     const conversationId = selectedIdRef.current;
-    if (!conversationId || !messageCursor || loadingOlderMessages) return;
+    if (
+      !conversationId ||
+      loadingOlderMessages ||
+      remoteHistoryPending
+    ) {
+      return;
+    }
+
     setLoadingOlderMessages(true);
     try {
-      const data = await apiRequest<{ messages: MessageDto[]; nextCursor: string | null }>(
-        `/api/conversations/${conversationId}/messages?before=${encodeURIComponent(messageCursor)}`,
-        { cache: "no-store" },
-        "No se pudieron cargar los mensajes anteriores"
-      );
-      if (selectedIdRef.current === conversationId) {
-        setMessages((current) => {
-          const known = new Set(current.map((message) => message.id));
-          return [...data.messages.filter((message) => !known.has(message.id)), ...current];
-        });
-        setMessageCursor(data.nextCursor);
+      if (messageCursor) {
+        const data = await apiRequest<{
+          messages: MessageDto[];
+          nextCursor: string | null;
+        }>(
+          `/api/conversations/${conversationId}/messages?before=${encodeURIComponent(messageCursor)}`,
+          { cache: "no-store" },
+          "No se pudieron cargar los mensajes anteriores"
+        );
+        if (selectedIdRef.current === conversationId) {
+          setMessages((current) => {
+            const known = new Set(current.map((message) => message.id));
+            return [
+              ...data.messages.filter((message) => !known.has(message.id)),
+              ...current,
+            ];
+          });
+          setMessageCursor(data.nextCursor);
+        }
+      } else {
+        if (
+          channelState?.status !== "connected" ||
+          remoteHistoryExhausted
+        ) {
+          return;
+        }
+        const result = await apiRequest<
+          | { requested: true; requestId: string }
+          | { requested: false; reason: "empty" }
+        >(
+          `/api/conversations/${conversationId}/history`,
+          { method: "POST" },
+          "No se pudo solicitar el historial anterior"
+        );
+        if (result.requested) setRemoteHistoryPending(true);
+        else setRemoteHistoryExhausted(true);
       }
       setError(null);
     } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "No se pudieron cargar los mensajes anteriores");
+      setError(
+        requestError instanceof Error
+          ? requestError.message
+          : "No se pudieron cargar los mensajes anteriores"
+      );
     } finally {
       setLoadingOlderMessages(false);
     }
-  }, [loadingOlderMessages, messageCursor]);
+  }, [
+    channelState?.status,
+    loadingOlderMessages,
+    messageCursor,
+    remoteHistoryExhausted,
+    remoteHistoryPending,
+  ]);
+
+  const inboxAvailable = isWhatsappInboxAvailable(channelState);
 
   useEffect(() => {
-    void refetchConversations();
-  }, [refetchConversations]);
+    if (inboxAvailable) void refetchConversations();
+  }, [inboxAvailable, refetchConversations]);
 
   const select = useCallback(
     (id: string) => {
       setSelectedId(id);
       setMessages([]);
       setMessageCursor(null);
+      setRemoteHistoryPending(false);
+      setRemoteHistoryExhausted(false);
       // Selección en la URL (spec 003 FR-P02): replaceState nativo = shallow,
       // no re-renderiza el server; al volver a /inbox se restaura.
       const url = new URL(window.location.href);
@@ -222,8 +298,26 @@ export function InboxClient() {
     },
     onChannelSync: ({ progress, inserted }) => {
       setSyncProgress(progress);
-      // Cada lote histórico ingerido trae conversaciones nuevas a la lista.
-      if (inserted > 0) void refetchConversations();
+      if (progress === null) {
+        setChannelState((current) =>
+          current
+            ? { ...current, initialImportComplete: true, syncProgress: null }
+            : current
+        );
+      }
+      if (inserted > 0) {
+        void refetchConversations();
+        if (selectedIdRef.current) {
+          void refetchMessages(selectedIdRef.current);
+        }
+      }
+      if (remoteHistoryPending) {
+        if (inserted === 0) setRemoteHistoryExhausted(true);
+        setRemoteHistoryPending(false);
+        if (selectedIdRef.current) {
+          void refetchMessages(selectedIdRef.current);
+        }
+      }
     },
     onPresence: ({ phone, composing }) => {
       if (typingTimerRef.current) clearTimeout(typingTimerRef.current);
@@ -316,9 +410,28 @@ export function InboxClient() {
     setMessageCursor(null);
   }, [selected, patchConversation]);
 
+  if (!channelState) {
+    return (
+      <div className="flex h-full items-center justify-center bg-chat">
+        <Loader2
+          className="h-6 w-6 animate-spin text-brand"
+          aria-label="Cargando WhatsApp"
+        />
+      </div>
+    );
+  }
+
+  if (!inboxAvailable) {
+    return (
+      <div className="h-full overflow-y-auto bg-chat">
+        <WhatsappQr />
+      </div>
+    );
+  }
+
   return (
     <div className="relative flex h-full">
-      {syncProgress !== null && (
+      {(syncProgress !== null || channelState.status === "reconnecting") && (
         <div
           className="absolute inset-x-0 top-0 z-20 flex items-center gap-3 border-b bg-brand-tint px-4 py-2 text-sm"
           role="status"
@@ -326,12 +439,14 @@ export function InboxClient() {
         >
           <Loader2 className="h-4 w-4 shrink-0 animate-spin text-brand" strokeWidth={1.8} />
           <span className="shrink-0 font-medium text-brand-text">
-            Cargando mensajes… {Math.round(syncProgress)}%
+            {channelState.status === "reconnecting"
+              ? "Reconectando con WhatsApp..."
+              : `Cargando mensajes... ${Math.round(syncProgress ?? 0)}%`}
           </span>
           <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-brand-soft">
             <div
               className="h-full rounded-full bg-brand transition-[width] duration-300"
-              style={{ width: `${Math.round(syncProgress)}%` }}
+              style={{ width: `${Math.round(syncProgress ?? 0)}%` }}
             />
           </div>
         </div>
@@ -419,8 +534,12 @@ export function InboxClient() {
             </header>
             <MessageThread
               messages={messages}
-              hasOlder={Boolean(messageCursor)}
-              loadingOlder={loadingOlderMessages}
+              hasOlder={
+                Boolean(messageCursor) ||
+                (channelState.status === "connected" &&
+                  !remoteHistoryExhausted)
+              }
+              loadingOlder={loadingOlderMessages || remoteHistoryPending}
               onLoadOlder={() => void loadOlderMessages()}
             />
             <Composer onSend={sendText} onTyping={emitTyping} />

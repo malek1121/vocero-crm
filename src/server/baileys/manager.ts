@@ -1,6 +1,8 @@
-import makeWASocket, { DisconnectReason } from "baileys";
+import makeWASocket, { Browsers, DisconnectReason, proto } from "baileys";
 import type { WASocket } from "baileys";
 import pino from "pino";
+import { and, asc, eq, isNotNull } from "drizzle-orm";
+import { getDb, schema } from "@/lib/db";
 import {
   clearAuthState,
   hasStoredSession,
@@ -12,19 +14,25 @@ import {
   createSessionLifecycle,
   isCurrentSession,
   replaceReconnectTimer,
+  resetExplicitUnlinkState,
+  startBestEffortLogout,
   stopSessionLifecycle,
   type SessionLifecycle,
 } from "@/server/baileys/lifecycle";
 import {
+  isBootstrapHistoryType,
+  shouldSyncHistoryType,
+} from "@/server/baileys/history-policy";
+import {
   ackToStatus,
-  extractContent,
   extractHistoryMessage,
   jidToPhone,
-  resolveMessagePhone,
   toJid,
 } from "@/server/baileys/map";
 import {
+  newHistoryBuffer,
   newHistoryIndex,
+  type HistoryBuffer,
   type HistoryIndex,
 } from "@/server/inbox/history";
 import { publish } from "@/server/events/bus";
@@ -64,14 +72,20 @@ function newSyncStats(): SyncStats {
  * sobrevivir el HMR de Next en dev.
  */
 
-export type ChannelStatus = "disconnected" | "connecting" | "qr" | "connected";
+export type ChannelStatus =
+  | "unlinked"
+  | "connecting"
+  | "qr"
+  | "connected"
+  | "reconnecting";
 export type ChannelStatusError =
   | "connection_failed"
   | "credentials_save_failed"
+  | "phone_mismatch"
   | null;
 
 export class ChannelError extends Error {
-  code: "not_connected" | "send_failed";
+  code: "not_connected" | "send_failed" | "history_unavailable";
   constructor(code: ChannelError["code"], message: string) {
     super(message);
     this.name = "ChannelError";
@@ -83,6 +97,8 @@ type Session = SessionLifecycle<WASocket> & {
   status: ChannelStatus;
   qr: string | null;
   phone: string | null;
+  storedPhone: string | null;
+  initialImportComplete: boolean;
   error: ChannelStatusError;
   /** 0–100 mientras sincroniza historial; null cuando no hay sync en curso. */
   syncProgress: number | null;
@@ -90,6 +106,8 @@ type Session = SessionLifecycle<WASocket> & {
   syncDone: boolean;
   /** Índice LID→teléfono/nombre acumulado del historial. */
   historyIndex: HistoryIndex;
+  /** Candidate messages for the bounded initial/relink history import. */
+  historyBuffer: HistoryBuffer;
   /** Diagnóstico acumulado del sync actual. */
   syncStats: SyncStats;
 };
@@ -116,16 +134,120 @@ async function lidToPhone(
   }
 }
 
+async function loadOrganizationWhatsAppState(
+  organizationId: string,
+  session: Session
+): Promise<void> {
+  const rows = await getDb()
+    .select({
+      whatsappPhone: schema.organization.whatsappPhone,
+      whatsappInitialImportedAt: schema.organization.whatsappInitialImportedAt,
+    })
+    .from(schema.organization)
+    .where(eq(schema.organization.id, organizationId))
+    .limit(1);
+  session.storedPhone = rows[0]?.whatsappPhone ?? null;
+  session.initialImportComplete = Boolean(
+    rows[0]?.whatsappInitialImportedAt
+  );
+}
+
+async function completeConnectionOpen(
+  organizationId: string,
+  session: Session,
+  generation: number,
+  socket: WASocket
+): Promise<void> {
+  if (!isCurrentSession(session, generation, socket)) return;
+  const actualPhone = jidToPhone(socket.user?.id ?? null);
+
+  if (
+    session.storedPhone &&
+    actualPhone &&
+    session.storedPhone !== actualPhone
+  ) {
+    session.generation += 1;
+    session.stopped = true;
+    session.socket = null;
+    session.status = "unlinked";
+    session.qr = null;
+    session.phone = null;
+    session.error = "phone_mismatch";
+    replaceReconnectTimer(session, null);
+    try {
+      await socket.logout();
+    } catch {
+      // The durable credential cleanup below is authoritative.
+    }
+    await clearAuthState(organizationId);
+    return;
+  }
+
+  if (!session.storedPhone && actualPhone) {
+    await getDb()
+      .update(schema.organization)
+      .set({ whatsappPhone: actualPhone })
+      .where(eq(schema.organization.id, organizationId));
+    session.storedPhone = actualPhone;
+  }
+
+  if (!isCurrentSession(session, generation, socket)) return;
+  session.status = "connected";
+  session.qr = null;
+  session.phone = actualPhone;
+  session.error = null;
+  if (!session.initialImportComplete) session.syncProgress = 0;
+
+  void import("@/server/inbox/send")
+    .then(({ resumeOutboundMessages }) =>
+      resumeOutboundMessages(organizationId)
+    )
+    .catch(() => console.error("[baileys] outbound_recovery_failed"));
+}
+
+async function finalizeBufferedHistory(
+  organizationId: string,
+  session: Session,
+  generation: number,
+  socket: WASocket
+): Promise<number> {
+  if (
+    session.syncDone ||
+    !isCurrentSession(session, generation, socket)
+  ) {
+    return 0;
+  }
+
+  const { ingestHistoryBatch, readHistoryMessages } = await import(
+    "@/server/inbox/history"
+  );
+  const selected = readHistoryMessages(session.historyBuffer);
+  const inserted = await ingestHistoryBatch(organizationId, selected);
+  await getDb()
+    .update(schema.organization)
+    .set({ whatsappInitialImportedAt: new Date() })
+    .where(eq(schema.organization.id, organizationId));
+
+  session.historyBuffer = newHistoryBuffer();
+  session.initialImportComplete = true;
+  session.syncDone = true;
+  session.syncProgress = null;
+  return inserted;
+}
+
 function newSession(): Session {
   return {
     ...createSessionLifecycle<WASocket>(),
-    status: "disconnected",
+    status: "unlinked",
     qr: null,
     phone: null,
+    storedPhone: null,
+    initialImportComplete: false,
     error: null,
     syncProgress: null,
     syncDone: false,
     historyIndex: newHistoryIndex(),
+    historyBuffer: newHistoryBuffer(),
     syncStats: newSyncStats(),
   };
 }
@@ -140,15 +262,21 @@ function getSession(organizationId: string): Session {
 
   // Compatibilidad con sesiones conservadas por HMR antes de estos campos.
   const legacy = session as Partial<Session> & { sock?: WASocket | null };
+  if ((legacy.status as string | undefined) === "disconnected") {
+    legacy.status = "unlinked";
+  }
   if (legacy.socket === undefined) legacy.socket = legacy.sock ?? null;
   legacy.generation ??= 0;
   legacy.stopped ??= false;
   legacy.startPromise ??= null;
   legacy.reconnectTimer ??= null;
   legacy.error ??= null;
+  legacy.storedPhone ??= null;
+  legacy.initialImportComplete ??= false;
   legacy.syncProgress ??= null;
   legacy.syncDone ??= false;
   legacy.historyIndex ??= newHistoryIndex();
+  legacy.historyBuffer ??= newHistoryBuffer();
   legacy.syncStats ??= newSyncStats();
   delete legacy.sock;
   return session;
@@ -160,6 +288,7 @@ export function getChannelStatus(organizationId: string): {
   phone: string | null;
   error: ChannelStatusError;
   syncProgress: number | null;
+  initialImportComplete: boolean;
 } {
   const session = getSession(organizationId);
   return {
@@ -168,6 +297,7 @@ export function getChannelStatus(organizationId: string): {
     phone: session.phone,
     error: session.error,
     syncProgress: session.syncProgress,
+    initialImportComplete: session.initialImportComplete,
   };
 }
 
@@ -182,7 +312,7 @@ function scheduleReconnect(
   generation: number
 ): void {
   if (session.stopped || !isCurrentSession(session, generation)) return;
-  session.status = "connecting";
+  session.status = "reconnecting";
 
   const timer = setTimeout(() => {
     if (
@@ -193,7 +323,7 @@ function scheduleReconnect(
       return;
     }
     session.reconnectTimer = null;
-    session.status = "disconnected";
+    session.status = "reconnecting";
     void startSessionInternal(organizationId, false).catch(() => {
       // startSessionInternal owns state mutation for its captured generation.
       console.error("[baileys] reconnect_failed");
@@ -213,7 +343,7 @@ function failCredentialPersistence(
   console.error("[baileys] credentials_save_failed");
   session.generation += 1;
   session.socket = null;
-  session.status = "disconnected";
+  session.status = "reconnecting";
   session.qr = null;
   session.phone = null;
   session.error = "credentials_save_failed";
@@ -226,15 +356,24 @@ async function openSession(
   session: Session,
   generation: number
 ): Promise<void> {
+  await loadOrganizationWhatsAppState(organizationId, session);
   const { state, saveCreds } = await loadDbAuthState(organizationId);
   if (!isCurrentSession(session, generation)) return;
 
   // syncFullHistory: WhatsApp entrega el historial en tandas con progreso
   // real (spec 004 FR-402) en vez de un único lote mínimo.
-  const socket = makeWASocket({ auth: state, logger, syncFullHistory: true });
+  const socket = makeWASocket({
+    auth: state,
+    logger,
+    browser: Browsers.macOS("Desktop"),
+    syncFullHistory: true,
+    shouldSyncHistoryMessage: (notification) =>
+      shouldSyncHistoryType(notification.syncType),
+  });
   session.socket = socket;
 
   socket.ev.on("creds.update", () => {
+    if (!isCurrentSession(session, generation, socket)) return;
     void saveCreds().catch(() =>
       failCredentialPersistence(organizationId, session, generation, socket)
     );
@@ -251,15 +390,19 @@ async function openSession(
     }
 
     if (connection === "open") {
-      session.status = "connected";
-      session.qr = null;
-      session.phone = jidToPhone(socket.user?.id ?? null);
-      session.error = null;
-      void import("@/server/inbox/send")
-        .then(({ resumeOutboundMessages }) =>
-          resumeOutboundMessages(organizationId)
-        )
-        .catch(() => console.error("[baileys] outbound_recovery_failed"));
+      void completeConnectionOpen(
+        organizationId,
+        session,
+        generation,
+        socket
+      ).catch(() => {
+        if (!isCurrentSession(session, generation, socket)) return;
+        session.error = "connection_failed";
+        session.status = session.initialImportComplete
+          ? "reconnecting"
+          : "unlinked";
+        console.error("[baileys] connection_open_failed");
+      });
     }
 
     if (connection !== "close") return;
@@ -274,7 +417,7 @@ async function openSession(
     if (statusCode === DisconnectReason.loggedOut) {
       session.generation += 1;
       session.stopped = true;
-      session.status = "disconnected";
+      session.status = "unlinked";
       session.error = null;
       replaceReconnectTimer(session, null);
       void clearAuthState(organizationId).catch(() =>
@@ -294,28 +437,42 @@ async function openSession(
 
   socket.ev.on("messaging-history.set", async (history) => {
     if (!isCurrentSession(session, generation, socket)) return;
-    const { chats, contacts, messages, lidPnMappings, progress, isLatest } =
-      history;
+    const {
+      chats,
+      contacts,
+      messages,
+      lidPnMappings,
+      progress,
+      syncType,
+      chunkOrder,
+    } = history;
     const stats = session.syncStats;
     let inserted = 0;
-    try {
-      const { ingestHistoryBatch, ingestHistoryChats, extendHistoryIndex } =
-        await import("@/server/inbox/history");
 
-      // 1) Acumular el índice LID→teléfono/nombre (autoritativo: lidPnMappings).
+    try {
+      const {
+        addHistoryMessages,
+        extendHistoryIndex,
+        ingestHistoryBatch,
+      } = await import("@/server/inbox/history");
+
       extendHistoryIndex(session.historyIndex, { lidPnMappings, contacts });
 
-      // 1b) WhatsApp no siempre manda lidPnMappings: resolver los LID faltantes
-      // por el store del socket (getPNForLID) antes de ingerir chats/mensajes.
       const lidJids = new Set<string>();
-      for (const c of chats ?? []) {
-        if (c.id?.endsWith("@lid") && !session.historyIndex.phone.has(c.id)) {
-          lidJids.add(c.id);
+      for (const chat of chats ?? []) {
+        if (
+          chat.id?.endsWith("@lid") &&
+          !session.historyIndex.phone.has(chat.id)
+        ) {
+          lidJids.add(chat.id);
         }
       }
-      for (const m of messages ?? []) {
-        const jid = m.key?.remoteJid;
-        if (jid?.endsWith("@lid") && !session.historyIndex.phone.has(jid)) {
+      for (const message of messages ?? []) {
+        const jid = message.key?.remoteJid;
+        if (
+          jid?.endsWith("@lid") &&
+          !session.historyIndex.phone.has(jid)
+        ) {
           lidJids.add(jid);
         }
       }
@@ -323,55 +480,84 @@ async function openSession(
         const phone = await lidToPhone(socket, lid);
         if (phone) session.historyIndex.phone.set(lid, phone);
       }
+
+      stats.chats += chats?.length ?? 0;
+      stats.messages += messages?.length ?? 0;
       stats.lidMappings = session.historyIndex.phone.size;
 
-      // 2) La LISTA de conversaciones vive en chats; los cuerpos en messages.
-      if (chats?.length) {
-        const chatStats = await ingestHistoryChats(
-          organizationId,
-          chats,
-          session.historyIndex
-        );
-        stats.chats += chats.length;
-        stats.created += chatStats.created;
-        stats.skippedGroup += chatStats.skippedGroup;
-        stats.skippedLid += chatStats.skippedLid;
-        stats.skippedOther += chatStats.skippedOther;
-        inserted += chatStats.created;
-      }
-
-      // 3) Mensajes: resolver LID con el índice acumulado.
-      stats.messages += messages?.length ?? 0;
       const items = (messages ?? [])
-        .map((m) => extractHistoryMessage(m, session.historyIndex.phone))
-        .filter((m): m is NonNullable<typeof m> => m !== null);
-      if (items.length > 0) {
-        const n = await ingestHistoryBatch(organizationId, items);
-        stats.messagesIngested += n;
-        inserted += n;
+        .map((message) =>
+          extractHistoryMessage(message, session.historyIndex.phone)
+        )
+        .filter((message): message is NonNullable<typeof message> =>
+          message !== null
+        );
+
+      const onDemand =
+        syncType === proto.HistorySync.HistorySyncType.ON_DEMAND;
+      const bootstrap = isBootstrapHistoryType(syncType);
+      const terminal =
+        syncType === proto.HistorySync.HistorySyncType.RECENT &&
+        typeof progress === "number" &&
+        progress >= 100;
+
+      if (onDemand && items.length > 0) {
+        inserted = await ingestHistoryBatch(organizationId, items);
+        stats.messagesIngested += inserted;
+      } else if (bootstrap && !session.syncDone) {
+        addHistoryMessages(session.historyBuffer, items);
+        session.syncProgress = progress ?? session.syncProgress ?? 0;
+
+        if (terminal) {
+          inserted = await finalizeBufferedHistory(
+            organizationId,
+            session,
+            generation,
+            socket
+          );
+          stats.messagesIngested += inserted;
+        }
       }
-    } catch {
-      console.error("[baileys] history_ingest_failed");
+    } catch (error) {
+      const name = error instanceof Error ? error.name : "unknown";
+      console.error(`[baileys] history_ingest_failed kind=${name}`);
     }
+
     stats.events += 1;
     stats.updatedAt = new Date().toISOString();
     console.info(
-      `[history] ev chats=${chats?.length ?? 0} msgs=${messages?.length ?? 0} lidMap=${lidPnMappings?.length ?? 0} | acc created=${stats.created} skGroup=${stats.skippedGroup} skLid=${stats.skippedLid} skOther=${stats.skippedOther} msgsIn=${stats.messagesIngested} idx=${stats.lidMappings}`
+      `[history] type=${syncType ?? "unknown"} chunk=${chunkOrder ?? "unknown"} progress=${progress ?? "unknown"} chats=${chats?.length ?? 0} msgs=${messages?.length ?? 0} selected=${session.historyBuffer.size} inserted=${inserted} idx=${stats.lidMappings}`
     );
 
     if (!isCurrentSession(session, generation, socket)) return;
-    // Terminado si isLatest o progress>=100 → apaga la pantalla de carga (null).
-    // Latch: una vez completo, los eventos tardíos no la vuelven a mostrar.
-    if (isLatest || (typeof progress === "number" && progress >= 100)) {
-      session.syncDone = true;
-    }
-    session.syncProgress = session.syncDone
-      ? null
-      : (progress ?? session.syncProgress ?? 0);
     publish(organizationId, {
       type: "channel.sync",
       data: { progress: session.syncProgress, inserted },
     });
+  });
+
+  socket.ev.on("messaging-history.status", (update) => {
+    if (
+      update.syncType !== proto.HistorySync.HistorySyncType.RECENT ||
+      update.status !== "paused" ||
+      !isCurrentSession(session, generation, socket)
+    ) {
+      return;
+    }
+    void finalizeBufferedHistory(
+      organizationId,
+      session,
+      generation,
+      socket
+    )
+      .then((inserted) => {
+        session.syncStats.messagesIngested += inserted;
+        publish(organizationId, {
+          type: "channel.sync",
+          data: { progress: null, inserted },
+        });
+      })
+      .catch(() => console.error("[baileys] history_finalize_failed"));
   });
 
   socket.ev.on("messages.upsert", async ({ messages, type }) => {
@@ -379,24 +565,47 @@ async function openSession(
       return;
     }
     const { ingestInboundMessage } = await import("@/server/inbox/ingest");
-    for (const msg of messages) {
+    const { ingestObservedOutgoingMessage } = await import(
+      "@/server/inbox/history"
+    );
+
+    for (const message of messages) {
       try {
         if (!isCurrentSession(session, generation, socket)) return;
-        const phone = resolveMessagePhone(msg.key);
-        if (!phone || !msg.key.id) continue;
-        const content = extractContent(msg.message);
-        if (!content) continue;
+
+        let item = extractHistoryMessage(
+          message,
+          session.historyIndex.phone
+        );
+        const remoteJid = message.key?.remoteJid;
+        if (!item && remoteJid?.endsWith("@lid")) {
+          const phone = await lidToPhone(socket, remoteJid);
+          if (phone) {
+            session.historyIndex.phone.set(remoteJid, phone);
+            item = extractHistoryMessage(
+              message,
+              session.historyIndex.phone
+            );
+          }
+        }
+        if (!item) continue;
+
+        if (item.direction === "out") {
+          await ingestObservedOutgoingMessage(organizationId, item);
+          continue;
+        }
+
         await ingestInboundMessage({
           organizationId,
-          from: phone,
-          profileName: msg.pushName ?? null,
-          waMessageId: msg.key.id,
-          type: content.type,
-          text: content.text,
-          timestamp: String(Number(msg.messageTimestamp ?? 0)),
+          from: item.phone,
+          profileName: message.pushName ?? null,
+          waMessageId: item.waMessageId,
+          type: item.type,
+          text: item.text,
+          timestamp: item.timestamp,
         });
       } catch {
-        console.error("[baileys] inbound_ingest_failed");
+        console.error("[baileys] live_message_ingest_failed");
       }
     }
   });
@@ -443,7 +652,8 @@ function startSessionInternal(
     session.socket &&
     (session.status === "connecting" ||
       session.status === "qr" ||
-      session.status === "connected")
+      session.status === "connected" ||
+      session.status === "reconnecting")
   ) {
     return Promise.resolve();
   }
@@ -459,13 +669,16 @@ function startSessionInternal(
   session.syncProgress = null;
   session.syncDone = false;
   session.historyIndex = newHistoryIndex();
+  session.historyBuffer = newHistoryBuffer();
   session.syncStats = newSyncStats();
 
   const tracked = openSession(organizationId, session, generation)
     .catch((error) => {
       if (isCurrentSession(session, generation)) {
         session.socket = null;
-        session.status = "disconnected";
+        session.status = session.initialImportComplete
+          ? "reconnecting"
+          : "unlinked";
         session.qr = null;
         session.phone = null;
         session.error = "connection_failed";
@@ -517,6 +730,81 @@ export async function sendChannelText(
     throw new ChannelError(
       "send_failed",
       "No se pudo enviar el mensaje por WhatsApp"
+    );
+  }
+}
+
+export type OlderHistoryRequestResult =
+  | { requested: true; requestId: string }
+  | { requested: false; reason: "not_found" | "empty" };
+
+/** Requests the previous WhatsApp page for one known direct conversation. */
+export async function requestOlderHistory(
+  organizationId: string,
+  conversationId: string
+): Promise<OlderHistoryRequestResult> {
+  const session = getSession(organizationId);
+  if (session.status !== "connected" || !session.socket) {
+    throw new ChannelError(
+      "history_unavailable",
+      "WhatsApp must be connected before requesting older history"
+    );
+  }
+
+  const db = getDb();
+  const conversations = await db
+    .select({ phone: schema.contact.phone })
+    .from(schema.conversation)
+    .innerJoin(
+      schema.contact,
+      eq(schema.conversation.contactId, schema.contact.id)
+    )
+    .where(
+      and(
+        eq(schema.conversation.organizationId, organizationId),
+        eq(schema.conversation.id, conversationId),
+        eq(schema.conversation.isTest, false)
+      )
+    )
+    .limit(1);
+  const conversation = conversations[0];
+  if (!conversation) return { requested: false, reason: "not_found" };
+
+  const messages = await db
+    .select({
+      waMessageId: schema.message.waMessageId,
+      direction: schema.message.direction,
+      waTimestamp: schema.message.waTimestamp,
+      createdAt: schema.message.createdAt,
+    })
+    .from(schema.message)
+    .where(
+      and(
+        eq(schema.message.organizationId, organizationId),
+        eq(schema.message.conversationId, conversationId),
+        isNotNull(schema.message.waMessageId)
+      )
+    )
+    .orderBy(asc(schema.message.waTimestamp), asc(schema.message.createdAt))
+    .limit(1);
+  const oldest = messages[0];
+  if (!oldest?.waMessageId) return { requested: false, reason: "empty" };
+
+  try {
+    const requestId = await session.socket.fetchMessageHistory(
+      50,
+      {
+        remoteJid: toJid(conversation.phone),
+        id: oldest.waMessageId,
+        fromMe: oldest.direction === "out",
+      },
+      (oldest.waTimestamp ?? oldest.createdAt).getTime()
+    );
+    return { requested: true, requestId };
+  } catch {
+    throw new ChannelError(
+      "history_unavailable",
+      "WhatsApp could not provide older history"
     );
   }
 }
@@ -582,17 +870,28 @@ export async function sendChannelTyping(
 export async function logoutSession(organizationId: string): Promise<void> {
   const session = getSession(organizationId);
   const socket = stopSessionLifecycle(session);
-  session.status = "disconnected";
+  session.status = "unlinked";
   session.qr = null;
   session.phone = null;
   session.error = null;
+  resetExplicitUnlinkState(session);
+  session.historyIndex = newHistoryIndex();
+  session.historyBuffer = newHistoryBuffer();
+  session.syncStats = newSyncStats();
 
-  try {
-    await socket?.logout();
-  } catch {
-    // El socket puede estar muerto; el borrado de credenciales manda.
-  }
-  await clearAuthState(organizationId);
+  await getDb().transaction(async (tx) => {
+    await tx
+      .delete(schema.baileysAuth)
+      .where(eq(schema.baileysAuth.organizationId, organizationId));
+    await tx
+      .update(schema.organization)
+      .set({
+        whatsappPhone: null,
+        whatsappInitialImportedAt: null,
+      })
+      .where(eq(schema.organization.id, organizationId));
+  });
+  startBestEffortLogout(socket);
 }
 
 /** Reanuda al boot las sesiones con credenciales guardadas (FR-B02). */

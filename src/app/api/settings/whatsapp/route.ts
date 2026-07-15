@@ -24,11 +24,10 @@ function ownerOnly(role: string): Response | null {
 
 /** Estado de la conexión Baileys; incluye el QR como data URL si aplica. */
 export const GET = withAuth(async (session) => {
-  const denied = ownerOnly(session.role);
-  if (denied) return denied;
-
   const state = getChannelStatus(session.organizationId);
-  const qrDataUrl = state.qr ? await QRCode.toDataURL(state.qr) : null;
+  const canManage = getChannelOwnerError(session.role) === null;
+  const qrDataUrl =
+    canManage && state.qr ? await QRCode.toDataURL(state.qr) : null;
   return noStore(
     Response.json({
       status: state.status,
@@ -36,6 +35,8 @@ export const GET = withAuth(async (session) => {
       qrDataUrl,
       error: state.error,
       syncProgress: state.syncProgress,
+      initialImportComplete: state.initialImportComplete,
+      canManage,
       sync: getSyncStats(session.organizationId),
     })
   );

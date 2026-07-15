@@ -1,6 +1,7 @@
 export type ChannelErrorCode =
   | "connection_failed"
-  | "credentials_save_failed";
+  | "credentials_save_failed"
+  | "phone_mismatch";
 
 /** Maps stable channel errors to safe user-facing copy. */
 export function getChannelErrorMessage(
@@ -11,10 +12,34 @@ export function getChannelErrorMessage(
     case undefined:
       return null;
     case "connection_failed":
-      return "No se pudo mantener la conexión con WhatsApp. Inténtalo de nuevo.";
+      return "No se pudo mantener la conexi\u00f3n con WhatsApp. Int\u00e9ntalo de nuevo.";
     case "credentials_save_failed":
-      return "No se pudieron guardar las credenciales de WhatsApp. Vuelve a conectar el número.";
+      return "No se pudieron guardar las credenciales de WhatsApp. Vuelve a conectar el n\u00famero.";
+    case "phone_mismatch":
+      return "Ese n\u00famero no coincide con el WhatsApp guardado en esta organizaci\u00f3n.";
     default:
-      return "WhatsApp informó un error. Inténtalo de nuevo.";
+      return "WhatsApp inform\u00f3 un error. Int\u00e9ntalo de nuevo.";
   }
+}
+
+export type WhatsappChannelStatus =
+  | "unlinked"
+  | "connecting"
+  | "qr"
+  | "connected"
+  | "reconnecting";
+
+export function isWhatsappInboxAvailable(
+  state:
+    | {
+        status: WhatsappChannelStatus;
+        initialImportComplete: boolean;
+      }
+    | null
+    | undefined
+): boolean {
+  return Boolean(
+    state?.initialImportComplete &&
+      (state.status === "connected" || state.status === "reconnecting")
+  );
 }

@@ -13,7 +13,8 @@ import { getDb, schema } from "@/lib/db";
 import { scoped } from "@/lib/db/tenant";
 import { encodeCursor, type InboxCursor } from "@/server/inbox/cursor";
 
-export const INBOX_PAGE_SIZE = 100;
+export const INBOX_CONVERSATION_PAGE_SIZE = 30;
+export const INBOX_MESSAGE_PAGE_SIZE = 100;
 
 export type ConversationDto = {
   id: string;
@@ -39,7 +40,7 @@ export async function listConversations(
   } = {}
 ): Promise<{ conversations: ConversationDto[]; nextCursor: string | null }> {
   const db = getDb();
-  const limit = Math.min(Math.max(options.limit ?? INBOX_PAGE_SIZE, 1), 200);
+  const limit = Math.min(Math.max(options.limit ?? INBOX_CONVERSATION_PAGE_SIZE, 1), 200);
   const previewSql = sql<string | null>`(
     select coalesce(m.text, m.type)
     from message m
@@ -83,7 +84,13 @@ export async function listConversations(
                 lt(schema.conversation.id, before.id)
               )
             )
-          : undefined
+          : undefined,
+        sql<boolean>`exists (
+          select 1
+          from ${schema.message} as visible_message
+          where visible_message.conversation_id = ${schema.conversation.id}
+            and visible_message.organization_id = ${organizationId}
+        )`
       )
     )
     .orderBy(desc(activitySql), desc(schema.conversation.id))
@@ -136,7 +143,7 @@ export async function listMessages(
   options: { since?: Date; before?: InboxCursor; limit?: number } = {}
 ) {
   const db = getDb();
-  const limit = Math.min(Math.max(options.limit ?? INBOX_PAGE_SIZE, 1), 200);
+  const limit = Math.min(Math.max(options.limit ?? INBOX_MESSAGE_PAGE_SIZE, 1), 200);
   const before = options.before;
   const rows = await db
     .select()

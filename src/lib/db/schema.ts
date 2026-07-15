@@ -70,6 +70,8 @@ export const organization = pgTable("organization", {
   name: text("name").notNull(),
   slug: text("slug").unique(),
   logo: text("logo"),
+  whatsappPhone: text("whatsapp_phone"),
+  whatsappInitialImportedAt: timestamp("whatsapp_initial_imported_at"),
   createdAt: timestamp("created_at").notNull().defaultNow(),
   metadata: text("metadata"),
 });

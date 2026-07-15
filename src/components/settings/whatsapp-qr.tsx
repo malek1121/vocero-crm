@@ -16,11 +16,31 @@ import {
 } from "@/components/settings/whatsapp-state";
 
 type ChannelState = {
-  status: "disconnected" | "connecting" | "qr" | "connected";
+  status: "unlinked" | "connecting" | "qr" | "connected" | "reconnecting";
   phone: string | null;
   qrDataUrl: string | null;
   error: ChannelErrorCode | null;
   syncProgress: number | null;
+  initialImportComplete: boolean;
+  canManage: boolean;
+};
+
+const COPY = {
+  description:
+    "Conecta tu n\u00famero desde WhatsApp > Dispositivos vinculados > Vincular un dispositivo.",
+  queryError: "No se pudo consultar el estado de WhatsApp.",
+  connectError: "No se pudo iniciar la conexi\u00f3n de WhatsApp.",
+  disconnectError: "No se pudo cerrar la sesi\u00f3n de WhatsApp.",
+  disconnectConfirm:
+    "\u00bfCerrar la sesi\u00f3n de WhatsApp? Tendr\u00e1s que volver a escanear el QR.",
+  loading: "Cargando las conversaciones recientes",
+  connected: "Conectado",
+  qrAlt: "C\u00f3digo QR para vincular WhatsApp",
+  qrRefresh: "El c\u00f3digo se renueva solo si expira.",
+  connecting: "Preparando la conexi\u00f3n...",
+  reconnecting: "Reconectando con WhatsApp...",
+  unlinked: "WhatsApp no est\u00e1 vinculado. Conecta el n\u00famero para abrir la bandeja.",
+  ownerRequired: "Pide al propietario de la organizaci\u00f3n que vincule WhatsApp.",
 };
 
 const POLL_MS = 2000;
@@ -32,17 +52,18 @@ export function WhatsappQr() {
 
   const refetch = useCallback(async () => {
     try {
-      const res = await fetch("/api/settings/whatsapp", { cache: "no-store" });
-      if (!res.ok) {
-        setError("No se pudo consultar el estado de WhatsApp.");
+      const response = await fetch("/api/settings/whatsapp", {
+        cache: "no-store",
+      });
+      if (!response.ok) {
+        setError(COPY.queryError);
         return;
       }
-
-      const nextState = (await res.json()) as ChannelState;
+      const nextState = (await response.json()) as ChannelState;
       setState(nextState);
       setError(getChannelErrorMessage(nextState.error));
     } catch {
-      setError("No se pudo consultar el estado de WhatsApp.");
+      setError(COPY.queryError);
     }
   }, []);
 
@@ -56,88 +77,87 @@ export function WhatsappQr() {
     setBusy(true);
     setError(null);
     try {
-      const res = await fetch("/api/settings/whatsapp", { method: "POST" });
-      if (!res.ok) {
-        setError("No se pudo iniciar la conexión de WhatsApp.");
+      const response = await fetch("/api/settings/whatsapp", { method: "POST" });
+      if (!response.ok) {
+        setError(COPY.connectError);
         return;
       }
       await refetch();
     } catch {
-      setError("No se pudo iniciar la conexión de WhatsApp.");
+      setError(COPY.connectError);
     } finally {
       setBusy(false);
     }
   }
 
   async function disconnect() {
-    if (
-      !confirm(
-        "¿Cerrar la sesión de WhatsApp? Tendrás que volver a escanear el QR."
-      )
-    ) {
-      return;
-    }
-
+    if (!confirm(COPY.disconnectConfirm)) return;
     setBusy(true);
     setError(null);
     try {
-      const res = await fetch("/api/settings/whatsapp", { method: "DELETE" });
-      if (!res.ok) {
-        setError("No se pudo cerrar la sesión de WhatsApp.");
+      const response = await fetch("/api/settings/whatsapp", {
+        method: "DELETE",
+      });
+      if (!response.ok) {
+        setError(COPY.disconnectError);
         return;
       }
+      setState((current) =>
+        current
+          ? {
+              ...current,
+              status: "unlinked",
+              phone: null,
+              qrDataUrl: null,
+              error: null,
+              syncProgress: null,
+              initialImportComplete: false,
+            }
+          : current
+      );
       await refetch();
     } catch {
-      setError("No se pudo cerrar la sesión de WhatsApp.");
+      setError(COPY.disconnectError);
     } finally {
       setBusy(false);
     }
   }
 
-  const status = state?.status ?? "disconnected";
+  const status = state?.status ?? "unlinked";
+  const importing =
+    status === "connected" && !state?.initialImportComplete;
 
   return (
     <div className="mx-auto max-w-lg p-6">
       <Card>
         <CardHeader>
           <CardTitle>WhatsApp</CardTitle>
-          <CardDescription>
-            Conecta tu número escaneando el QR desde el teléfono: WhatsApp →
-            Dispositivos vinculados → Vincular un dispositivo.
-          </CardDescription>
+          <CardDescription>{COPY.description}</CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
           <div role="status" aria-live="polite" aria-atomic="true">
-            {status === "connected" &&
-              typeof state?.syncProgress === "number" && (
-                <div className="space-y-2 rounded-md border border-brand-soft bg-brand-tint p-3 text-sm">
-                  <div className="flex items-center gap-2">
-                    <Loader2
-                      className="h-4 w-4 animate-spin text-primary"
-                      aria-hidden="true"
-                    />
-                    <span>
-                      Cargando mensajes… {Math.round(state.syncProgress)}%
-                    </span>
-                  </div>
-                  <div className="h-1.5 w-full overflow-hidden rounded-full bg-brand-soft">
-                    <div
-                      className="h-full rounded-full bg-primary transition-[width] duration-300"
-                      style={{ width: `${Math.round(state.syncProgress)}%` }}
-                    />
-                  </div>
+            {importing && (
+              <div className="space-y-2 rounded-md border border-brand-soft bg-brand-tint p-3 text-sm">
+                <div className="flex items-center gap-2">
+                  <Loader2 className="h-4 w-4 animate-spin text-primary" aria-hidden="true" />
+                  <span>
+                    {COPY.loading}... {Math.round(state?.syncProgress ?? 0)}%
+                  </span>
                 </div>
-              )}
+                <div className="h-1.5 w-full overflow-hidden rounded-full bg-brand-soft">
+                  <div
+                    className="h-full rounded-full bg-primary transition-[width] duration-300"
+                    style={{ width: `${Math.round(state?.syncProgress ?? 0)}%` }}
+                  />
+                </div>
+              </div>
+            )}
 
-            {status === "connected" && state?.syncProgress == null && (
+            {status === "connected" && !importing && (
               <div className="flex items-center gap-2 rounded-md border border-brand-soft bg-brand-tint p-3 text-sm">
-                <CheckCircle2
-                  className="h-4 w-4 text-primary"
-                  aria-hidden="true"
-                />
+                <CheckCircle2 className="h-4 w-4 text-primary" aria-hidden="true" />
                 <span>
-                  Conectado{state?.phone ? ` como +${state.phone}` : ""}. Los
-                  mensajes entran y salen por este número.
+                  {COPY.connected}{state?.phone ? ` como +${state.phone}` : ""}.
                 </span>
               </div>
             )}
@@ -147,54 +167,41 @@ export function WhatsappQr() {
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
                   src={state.qrDataUrl}
-                  alt="Código QR para vincular WhatsApp"
+                  alt={COPY.qrAlt}
                   className="h-56 w-56 rounded-md border bg-white p-2"
                 />
-                <p className="text-xs text-muted-foreground">
-                  El código se renueva solo; si expira, aparece uno nuevo.
-                </p>
+                <p className="text-xs text-muted-foreground">{COPY.qrRefresh}</p>
               </div>
             )}
 
-            {status === "connecting" && (
+            {(status === "connecting" || status === "reconnecting") && (
               <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                <Loader2
-                  className="h-4 w-4 animate-spin"
-                  aria-hidden="true"
-                />
-                Conectando…
+                <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+                {status === "reconnecting" ? COPY.reconnecting : COPY.connecting}
               </div>
             )}
 
-            {status === "disconnected" && (
+            {status === "unlinked" && (
               <p className="text-sm text-muted-foreground">
-                Sin sesión activa. Pulsa Conectar para generar el código QR.
+                {state?.canManage === false ? COPY.ownerRequired : COPY.unlinked}
               </p>
             )}
           </div>
 
           {error && (
-            <p
-              className="text-sm text-destructive"
-              role="alert"
-              aria-live="assertive"
-            >
+            <p className="text-sm text-destructive" role="alert" aria-live="assertive">
               {error}
             </p>
           )}
 
           <div className="flex gap-2">
-            {status === "disconnected" && (
-              <Button
-                onClick={() => void connect()}
-                disabled={busy}
-                aria-busy={busy}
-              >
+            {status === "unlinked" && state?.canManage === true && (
+              <Button onClick={() => void connect()} disabled={busy} aria-busy={busy}>
                 <QrCode className="mr-2 h-4 w-4" aria-hidden="true" />
                 Conectar
               </Button>
             )}
-            {status !== "disconnected" && (
+            {status !== "unlinked" && state?.canManage !== false && (
               <Button
                 variant="outline"
                 onClick={() => void disconnect()}

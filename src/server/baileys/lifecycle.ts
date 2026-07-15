@@ -59,3 +59,31 @@ export function stopSessionLifecycle<TSocket>(
   state.socket = null;
   return socket;
 }
+export type ExplicitUnlinkState = {
+  storedPhone: string | null;
+  initialImportComplete: boolean;
+  syncProgress: number | null;
+  syncDone: boolean;
+};
+
+export function resetExplicitUnlinkState(state: ExplicitUnlinkState): void {
+  state.storedPhone = null;
+  state.initialImportComplete = false;
+  state.syncProgress = null;
+  state.syncDone = false;
+}
+
+export type ProviderLogoutSocket = {
+  logout(): Promise<unknown>;
+};
+
+export function startBestEffortLogout(
+  socket: ProviderLogoutSocket | null | undefined
+): void {
+  if (!socket) return;
+  try {
+    void socket.logout().catch(() => undefined);
+  } catch {
+    // Provider cleanup is best-effort; durable state is authoritative.
+  }
+}

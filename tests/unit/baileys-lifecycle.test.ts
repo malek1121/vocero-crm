@@ -4,6 +4,8 @@ import {
   createSessionLifecycle,
   isCurrentSession,
   replaceReconnectTimer,
+  resetExplicitUnlinkState,
+  startBestEffortLogout,
   stopSessionLifecycle,
 } from "@/server/baileys/lifecycle";
 
@@ -68,5 +70,30 @@ describe("Baileys session lifecycle", () => {
     expect(state.startPromise).toBeNull();
     expect(state.reconnectTimer).toBeNull();
     expect(clearTimer).toHaveBeenCalledWith(timer);
+  });
+
+  it("does not wait for a stuck provider logout", () => {
+    const logout = vi.fn(() => new Promise<void>(() => undefined));
+
+    expect(startBestEffortLogout({ logout })).toBeUndefined();
+    expect(logout).toHaveBeenCalledOnce();
+  });
+
+  it("resets only WhatsApp binding and import state on explicit unlink", () => {
+    const state = {
+      storedPhone: "51999999999",
+      initialImportComplete: true,
+      syncProgress: 84,
+      syncDone: true,
+    };
+
+    resetExplicitUnlinkState(state);
+
+    expect(state).toEqual({
+      storedPhone: null,
+      initialImportComplete: false,
+      syncProgress: null,
+      syncDone: false,
+    });
   });
 });
