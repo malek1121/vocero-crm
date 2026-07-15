@@ -21,3 +21,25 @@ export function getChannelErrorMessage(
       return "WhatsApp inform\u00f3 un error. Int\u00e9ntalo de nuevo.";
   }
 }
+
+export type WhatsappChannelStatus =
+  | "unlinked"
+  | "connecting"
+  | "qr"
+  | "connected"
+  | "reconnecting";
+
+export function isWhatsappInboxAvailable(
+  state:
+    | {
+        status: WhatsappChannelStatus;
+        initialImportComplete: boolean;
+      }
+    | null
+    | undefined
+): boolean {
+  return Boolean(
+    state?.initialImportComplete &&
+      (state.status === "connected" || state.status === "reconnecting")
+  );
+}

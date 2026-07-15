@@ -7,7 +7,6 @@ import { publish } from "@/server/events/bus";
 import { serializeMessage } from "@/server/inbox/ingest";
 
 export const HISTORY_CHAT_LIMIT = 30;
-export const HISTORY_MESSAGES_PER_CHAT = 100;
 
 type BufferedChat = {
   latestTimestamp: number;
@@ -32,8 +31,7 @@ function historyTimestamp(item: HistoryMessage): number {
 export function addHistoryMessages(
   buffer: HistoryBuffer,
   items: HistoryMessage[],
-  chatLimit = HISTORY_CHAT_LIMIT,
-  messageLimit = HISTORY_MESSAGES_PER_CHAT
+  chatLimit = HISTORY_CHAT_LIMIT
 ): void {
   const byPhone = new Map<string, HistoryMessage[]>();
   for (const item of items) {
@@ -65,10 +63,6 @@ export function addHistoryMessages(
       chat.messages.set(item.waMessageId, item);
     }
 
-    const newest = [...chat.messages.values()]
-      .sort((a, b) => historyTimestamp(b) - historyTimestamp(a))
-      .slice(0, messageLimit);
-    chat.messages = new Map(newest.map((item) => [item.waMessageId, item]));
     buffer.set(phone, chat);
   }
 }

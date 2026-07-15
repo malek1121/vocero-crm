@@ -102,6 +102,19 @@ export function WhatsappQr() {
         setError(COPY.disconnectError);
         return;
       }
+      setState((current) =>
+        current
+          ? {
+              ...current,
+              status: "unlinked",
+              phone: null,
+              qrDataUrl: null,
+              error: null,
+              syncProgress: null,
+              initialImportComplete: false,
+            }
+          : current
+      );
       await refetch();
     } catch {
       setError(COPY.disconnectError);

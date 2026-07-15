@@ -1,4 +1,4 @@
-import makeWASocket, { DisconnectReason, proto } from "baileys";
+import makeWASocket, { Browsers, DisconnectReason, proto } from "baileys";
 import type { WASocket } from "baileys";
 import pino from "pino";
 import { and, asc, eq, isNotNull } from "drizzle-orm";
@@ -14,9 +14,14 @@ import {
   createSessionLifecycle,
   isCurrentSession,
   replaceReconnectTimer,
+  resetExplicitUnlinkState,
   stopSessionLifecycle,
   type SessionLifecycle,
 } from "@/server/baileys/lifecycle";
+import {
+  isBootstrapHistoryType,
+  shouldSyncHistoryType,
+} from "@/server/baileys/history-policy";
 import {
   ackToStatus,
   extractHistoryMessage,
@@ -359,9 +364,10 @@ async function openSession(
   const socket = makeWASocket({
     auth: state,
     logger,
-    syncFullHistory: false,
+    browser: Browsers.macOS("Desktop"),
+    syncFullHistory: true,
     shouldSyncHistoryMessage: (notification) =>
-      notification.syncType !== proto.HistorySync.HistorySyncType.FULL,
+      shouldSyncHistoryType(notification.syncType),
   });
   session.socket = socket;
 
@@ -487,10 +493,7 @@ async function openSession(
 
       const onDemand =
         syncType === proto.HistorySync.HistorySyncType.ON_DEMAND;
-      const bootstrap =
-        syncType == null ||
-        syncType === proto.HistorySync.HistorySyncType.INITIAL_BOOTSTRAP ||
-        syncType === proto.HistorySync.HistorySyncType.RECENT;
+      const bootstrap = isBootstrapHistoryType(syncType);
       const terminal =
         syncType === proto.HistorySync.HistorySyncType.RECENT &&
         typeof progress === "number" &&
@@ -869,13 +872,28 @@ export async function logoutSession(organizationId: string): Promise<void> {
   session.qr = null;
   session.phone = null;
   session.error = null;
+  resetExplicitUnlinkState(session);
+  session.historyIndex = newHistoryIndex();
+  session.historyBuffer = newHistoryBuffer();
+  session.syncStats = newSyncStats();
 
   try {
     await socket?.logout();
   } catch {
     // El socket puede estar muerto; el borrado de credenciales manda.
   }
-  await clearAuthState(organizationId);
+  await getDb().transaction(async (tx) => {
+    await tx
+      .delete(schema.baileysAuth)
+      .where(eq(schema.baileysAuth.organizationId, organizationId));
+    await tx
+      .update(schema.organization)
+      .set({
+        whatsappPhone: null,
+        whatsappInitialImportedAt: null,
+      })
+      .where(eq(schema.organization.id, organizationId));
+  });
 }
 
 /** Reanuda al boot las sesiones con credenciales guardadas (FR-B02). */

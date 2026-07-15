@@ -59,3 +59,16 @@ export function stopSessionLifecycle<TSocket>(
   state.socket = null;
   return socket;
 }
+export type ExplicitUnlinkState = {
+  storedPhone: string | null;
+  initialImportComplete: boolean;
+  syncProgress: number | null;
+  syncDone: boolean;
+};
+
+export function resetExplicitUnlinkState(state: ExplicitUnlinkState): void {
+  state.storedPhone = null;
+  state.initialImportComplete = false;
+  state.syncProgress = null;
+  state.syncDone = false;
+}
