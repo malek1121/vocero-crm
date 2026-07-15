@@ -15,6 +15,7 @@ import {
   isCurrentSession,
   replaceReconnectTimer,
   resetExplicitUnlinkState,
+  startBestEffortLogout,
   stopSessionLifecycle,
   type SessionLifecycle,
 } from "@/server/baileys/lifecycle";
@@ -372,6 +373,7 @@ async function openSession(
   session.socket = socket;
 
   socket.ev.on("creds.update", () => {
+    if (!isCurrentSession(session, generation, socket)) return;
     void saveCreds().catch(() =>
       failCredentialPersistence(organizationId, session, generation, socket)
     );
@@ -877,11 +879,6 @@ export async function logoutSession(organizationId: string): Promise<void> {
   session.historyBuffer = newHistoryBuffer();
   session.syncStats = newSyncStats();
 
-  try {
-    await socket?.logout();
-  } catch {
-    // El socket puede estar muerto; el borrado de credenciales manda.
-  }
   await getDb().transaction(async (tx) => {
     await tx
       .delete(schema.baileysAuth)
@@ -894,6 +891,7 @@ export async function logoutSession(organizationId: string): Promise<void> {
       })
       .where(eq(schema.organization.id, organizationId));
   });
+  startBestEffortLogout(socket);
 }
 
 /** Reanuda al boot las sesiones con credenciales guardadas (FR-B02). */

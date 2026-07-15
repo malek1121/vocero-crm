@@ -72,3 +72,18 @@ export function resetExplicitUnlinkState(state: ExplicitUnlinkState): void {
   state.syncProgress = null;
   state.syncDone = false;
 }
+
+export type ProviderLogoutSocket = {
+  logout(): Promise<unknown>;
+};
+
+export function startBestEffortLogout(
+  socket: ProviderLogoutSocket | null | undefined
+): void {
+  if (!socket) return;
+  try {
+    void socket.logout().catch(() => undefined);
+  } catch {
+    // Provider cleanup is best-effort; durable state is authoritative.
+  }
+}
