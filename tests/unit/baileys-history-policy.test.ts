@@ -1,8 +1,12 @@
-﻿import { describe, expect, it } from "vitest";
+import { proto } from "baileys";
+import { describe, expect, it } from "vitest";
+import {
+  isBootstrapHistoryType,
+  shouldSyncHistoryType,
+} from "@/server/baileys/history-policy";
 import {
   addHistoryMessages,
   HISTORY_CHAT_LIMIT,
-  HISTORY_MESSAGES_PER_CHAT,
   newHistoryBuffer,
   readHistoryMessages,
   type HistoryMessage,
@@ -43,20 +47,35 @@ describe("bounded WhatsApp history policy", () => {
     expect(phones.has("1029")).toBe(false);
   });
 
-  it("deduplicates messages and caps each selected chat", () => {
+  it("deduplicates messages without truncating a selected chat", () => {
     const buffer = newHistoryBuffer();
     const items = Array.from(
-      { length: HISTORY_MESSAGES_PER_CHAT + 20 },
+      { length: 120 },
       (_, index) => message("51999999999", index + 1, `m-${index}`)
     );
     addHistoryMessages(buffer, [...items, items[0]!]);
 
     const stored = readHistoryMessages(buffer);
-    expect(stored).toHaveLength(HISTORY_MESSAGES_PER_CHAT);
-    expect(new Set(stored.map((item) => item.waMessageId))).toHaveLength(
-      HISTORY_MESSAGES_PER_CHAT
-    );
+    expect(stored).toHaveLength(items.length);
+    expect(new Set(stored.map((item) => item.waMessageId))).toHaveLength(items.length);
     expect(stored.at(-1)?.waMessageId).toBe(`m-${items.length - 1}`);
+  });
+});
+
+describe("Baileys history sync policy", () => {
+  const syncType = proto.HistorySync.HistorySyncType;
+
+  it("accepts full, bootstrap, recent, and on-demand history", () => {
+    expect(shouldSyncHistoryType(syncType.FULL)).toBe(true);
+    expect(shouldSyncHistoryType(syncType.INITIAL_BOOTSTRAP)).toBe(true);
+    expect(shouldSyncHistoryType(syncType.RECENT)).toBe(true);
+    expect(shouldSyncHistoryType(syncType.ON_DEMAND)).toBe(true);
+    expect(shouldSyncHistoryType(syncType.PUSH_NAME)).toBe(false);
+  });
+
+  it("treats full history as part of the initial import", () => {
+    expect(isBootstrapHistoryType(syncType.FULL)).toBe(true);
+    expect(isBootstrapHistoryType(syncType.ON_DEMAND)).toBe(false);
   });
 });
 
